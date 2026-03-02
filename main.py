@@ -2,7 +2,6 @@ import asyncio
 import contextlib
 import ipaddress
 import json
-import socket
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -124,6 +123,7 @@ class SteamFriendMonitor(Star):
         self.bytes_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self.icon_url_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._config_lock = asyncio.Lock()
+        self._bg_tasks: set[asyncio.Task] = set()
 
     async def initialize(self):
         self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
@@ -137,6 +137,9 @@ class SteamFriendMonitor(Star):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        for t in list(self._bg_tasks):
+            t.cancel()
+        self._bg_tasks.clear()
         if self.http:
             await self.http.aclose()
             self.http = None
@@ -171,14 +174,15 @@ class SteamFriendMonitor(Star):
 
     async def _update_targets_atomic(self, targets: List[str]):
         async with self._config_lock:
-            await self._update_targets_atomic(targets)
+            self._set_targets(targets)
 
-    def _is_host_resolved_private(self, host: str) -> bool:
+    async def _is_host_resolved_private(self, host: str) -> bool:
         host = (host or "").strip()
         if not host:
             return True
         with contextlib.suppress(Exception):
-            infos = socket.getaddrinfo(host, None)
+            loop = asyncio.get_running_loop()
+            infos = await loop.getaddrinfo(host, None)
             for info in infos:
                 ip_str = info[4][0]
                 with contextlib.suppress(Exception):
@@ -198,6 +202,11 @@ class SteamFriendMonitor(Star):
         await asyncio.sleep(max(1, delay_sec))
         with contextlib.suppress(Exception):
             Path(image_path).unlink(missing_ok=True)
+
+    def _schedule_delayed_unlink(self, image_path: str, delay_sec: int = 30):
+        task = asyncio.create_task(self._delayed_unlink(image_path, delay_sec))
+        self._bg_tasks.add(task)
+        task.add_done_callback(lambda t: self._bg_tasks.discard(t))
 
     def _cache_ttl(self) -> int:
         return max(60, int(self.config.get("cache_ttl_sec", 3600) or 3600))
@@ -326,7 +335,7 @@ class SteamFriendMonitor(Star):
                 return url
         return prefix + encoded
 
-    def _is_allowed_remote_url(self, url: str) -> bool:
+    async def _is_allowed_remote_url(self, url: str) -> bool:
         try:
             parsed = urlparse(url)
             scheme = (parsed.scheme or "").lower()
@@ -335,7 +344,7 @@ class SteamFriendMonitor(Star):
                 return False
             if self._is_private_host(host):
                 return False
-            if self._is_host_resolved_private(host):
+            if await self._is_host_resolved_private(host):
                 return False
 
             strict = bool(self.config.get("strict_remote_host", False))
@@ -379,7 +388,7 @@ class SteamFriendMonitor(Star):
 
         for origin in candidates:
             current = origin
-            if not self._is_allowed_remote_url(current):
+            if not await self._is_allowed_remote_url(current):
                 logger.debug(f"[steam-monitor] blocked remote url: {current}")
                 continue
 
@@ -394,7 +403,7 @@ class SteamFriendMonitor(Star):
                             if not location:
                                 break
                             next_url = str(httpx.URL(location, base=resp.request.url))
-                            if not self._is_allowed_remote_url(next_url):
+                            if not await self._is_allowed_remote_url(next_url):
                                 logger.warning(
                                     f"[steam-monitor] blocked redirect target: {next_url}"
                                 )
@@ -899,7 +908,7 @@ class SteamFriendMonitor(Star):
             yield event.chain_result(chain)
         finally:
             if image_path:
-                asyncio.create_task(self._delayed_unlink(image_path, 30))
+                self._schedule_delayed_unlink(image_path, 30)
 
     @filter.command("sfm_test")
     async def steam_monitor_test(self, event: AstrMessageEvent, action: str = "all"):
@@ -975,4 +984,4 @@ class SteamFriendMonitor(Star):
             yield event.plain_result(f"[steam_monitor_test] 执行失败: {e}")
         finally:
             if image_path:
-                asyncio.create_task(self._delayed_unlink(image_path, 30))
+                self._schedule_delayed_unlink(image_path, 30)
