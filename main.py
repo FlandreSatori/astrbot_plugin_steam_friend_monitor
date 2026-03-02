@@ -155,6 +155,11 @@ class SteamFriendMonitor(Star):
         except Exception as e:
             logger.warning(f"[steam-monitor] save config failed: {e}")
 
+    async def _delayed_unlink(self, image_path: str, delay_sec: int = 30):
+        await asyncio.sleep(max(1, delay_sec))
+        with contextlib.suppress(Exception):
+            Path(image_path).unlink(missing_ok=True)
+
     def _cache_ttl(self) -> int:
         return max(60, int(self.config.get("cache_ttl_sec", 3600) or 3600))
 
@@ -215,7 +220,9 @@ class SteamFriendMonitor(Star):
             if sid and sid not in uniq_ids:
                 uniq_ids.append(sid)
 
-        batch_size = max(10, int(self.config.get("steam_batch_size", 100) or 100))
+        batch_size = min(
+            100, max(1, int(self.config.get("steam_batch_size", 100) or 100))
+        )
         players: List[Dict[str, Any]] = []
         for i in range(0, len(uniq_ids), batch_size):
             chunk = uniq_ids[i : i + batch_size]
@@ -286,6 +293,32 @@ class SteamFriendMonitor(Star):
                 return url
         return prefix + encoded
 
+    def _is_allowed_remote_url(self, url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            scheme = (parsed.scheme or "").lower()
+            host = (parsed.hostname or "").lower()
+            if scheme not in ("http", "https"):
+                return False
+            if self._is_private_host(host):
+                return False
+
+            strict = bool(self.config.get("strict_remote_host", False))
+            if not strict:
+                return True
+
+            custom = parse_ids(self.config.get("remote_host_allowlist", ""))
+            allow = [
+                "steamcommunity.com",
+                "steamstatic.com",
+                "steampowered.com",
+                "akamaihd.net",
+                "images.weserv.nl",
+            ] + custom
+            return any(host == d or host.endswith("." + d) for d in allow)
+        except Exception:
+            return False
+
     async def _fetch_url_bytes(
         self,
         url: str,
@@ -308,6 +341,9 @@ class SteamFriendMonitor(Star):
             candidates.append(self._with_image_proxy(url, proxy_prefix))
 
         for u in candidates:
+            if not self._is_allowed_remote_url(u):
+                logger.debug(f"[steam-monitor] blocked remote url: {u}")
+                continue
             try:
                 async with self.http.stream("GET", u) as resp:
                     if resp.status_code != 200:
@@ -531,13 +567,19 @@ class SteamFriendMonitor(Star):
         # 基于完整监控集合（配置 ID + state）计算，而不是仅 API 返回列表
         all_ids = []
         for sid in steam_ids + list(self.state.keys()):
-            if sid and sid not in all_ids:
+            if not sid:
+                continue
+            if isinstance(sid, str) and sid.startswith("_"):
+                continue
+            if sid not in all_ids:
                 all_ids.append(sid)
 
         any_online = False
         offline_minutes_max = 0.0
         for sid in all_ids:
             record = self.state.get(sid, {})
+            if not isinstance(record, dict):
+                continue
             st = int(record.get("personastate", 0) or 0)
             if st != 0:
                 any_online = True
@@ -790,8 +832,7 @@ class SteamFriendMonitor(Star):
             yield event.chain_result(chain)
         finally:
             if image_path:
-                with contextlib.suppress(Exception):
-                    Path(image_path).unlink(missing_ok=True)
+                asyncio.create_task(self._delayed_unlink(image_path, 30))
 
     @filter.command("sfm_test")
     async def steam_monitor_test(self, event: AstrMessageEvent, action: str = "all"):
@@ -867,5 +908,4 @@ class SteamFriendMonitor(Star):
             yield event.plain_result(f"[steam_monitor_test] 执行失败: {e}")
         finally:
             if image_path:
-                with contextlib.suppress(Exception):
-                    Path(image_path).unlink(missing_ok=True)
+                asyncio.create_task(self._delayed_unlink(image_path, 30))
