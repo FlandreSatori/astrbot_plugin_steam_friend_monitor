@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import ipaddress
 import json
 import time
 from collections import OrderedDict
@@ -209,11 +210,50 @@ class SteamFriendMonitor(Star):
         if not self.http:
             self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
 
-        params = {"key": api_key, "steamids": ",".join(steam_ids)}
-        r = await self.http.get(STEAM_SUMMARY_API, params=params)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("response", {}).get("players", [])
+        uniq_ids = []
+        for sid in steam_ids:
+            if sid and sid not in uniq_ids:
+                uniq_ids.append(sid)
+
+        batch_size = max(10, int(self.config.get("steam_batch_size", 100) or 100))
+        players: List[Dict[str, Any]] = []
+        for i in range(0, len(uniq_ids), batch_size):
+            chunk = uniq_ids[i : i + batch_size]
+            params = {"key": api_key, "steamids": ",".join(chunk)}
+            r = await self.http.get(STEAM_SUMMARY_API, params=params)
+            r.raise_for_status()
+            data = r.json()
+            players.extend(data.get("response", {}).get("players", []))
+
+        return players
+
+    def _is_private_host(self, host: str) -> bool:
+        host = (host or "").strip().lower()
+        if not host:
+            return True
+        if host in {"localhost", "localhost.localdomain"}:
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+            return (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+                or ip.is_unspecified
+            )
+        except Exception:
+            # 域名层面的基础阻断（可按需扩展白名单）
+            bad_suffixes = (
+                ".local",
+                ".lan",
+                ".home",
+                ".internal",
+                ".corp",
+                ".localhost",
+            )
+            return host.endswith(bad_suffixes)
 
     def _with_image_proxy(self, url: str, proxy_prefix: str) -> str:
         prefix = (proxy_prefix or "").strip()
@@ -228,8 +268,8 @@ class SteamFriendMonitor(Star):
             if scheme and scheme not in ("http", "https"):
                 logger.warning(f"[steam-monitor] invalid proxy scheme: {scheme}")
                 return url
-            if host in {"localhost", "127.0.0.1", "::1"}:
-                logger.warning("[steam-monitor] blocked local proxy host")
+            if self._is_private_host(host):
+                logger.warning("[steam-monitor] blocked private/local proxy host")
                 return url
         except Exception as e:
             logger.warning(f"[steam-monitor] invalid proxy prefix: {e}")
@@ -239,7 +279,11 @@ class SteamFriendMonitor(Star):
         if "{url}" in prefix:
             return prefix.replace("{url}", encoded)
         if "%s" in prefix:
-            return prefix % encoded
+            try:
+                return prefix % encoded
+            except Exception as e:
+                logger.warning(f"[steam-monitor] invalid proxy format: {e}")
+                return url
         return prefix + encoded
 
     async def _fetch_url_bytes(
@@ -334,6 +378,15 @@ class SteamFriendMonitor(Star):
     ) -> Image.Image | None:
         try:
             with Image.open(BytesIO(raw)) as opened:
+                max_pixels = max(
+                    512 * 512,
+                    int(self.config.get("max_image_pixels", 4_000_000) or 4_000_000),
+                )
+                if opened.width * opened.height > max_pixels:
+                    logger.warning(
+                        f"[steam-monitor] image too large: {opened.width}x{opened.height}"
+                    )
+                    return None
                 img = opened.convert("RGBA")
             img = img.resize(size, Image.Resampling.LANCZOS)
             if circle:
@@ -387,7 +440,8 @@ class SteamFriendMonitor(Star):
 
             game_icon = None
             if gameid:
-                icon_url = await self._get_game_icon_url(gameid)
+                async with sem:
+                    icon_url = await self._get_game_icon_url(gameid)
                 if icon_url:
                     async with sem:
                         game_icon = await self._load_remote_image(
@@ -473,23 +527,29 @@ class SteamFriendMonitor(Star):
         chain.chain = [Comp.Plain(text=text), Comp.Image.fromFileSystem(image_path)]
         await self.context.send_message(umo, chain)
 
-    def _compute_next_interval(
-        self, players: List[Dict[str, Any]], default_sec: int
-    ) -> int:
-        any_online = any(int(p.get("personastate", 0)) != 0 for p in players)
-        if any_online:
-            return max(10, default_sec)
+    def _compute_next_interval(self, steam_ids: List[str], default_sec: int) -> int:
+        # 基于完整监控集合（配置 ID + state）计算，而不是仅 API 返回列表
+        all_ids = []
+        for sid in steam_ids + list(self.state.keys()):
+            if sid and sid not in all_ids:
+                all_ids.append(sid)
 
+        any_online = False
         offline_minutes_max = 0.0
-        for p in players:
-            sid = p.get("steamid", "")
+        for sid in all_ids:
             record = self.state.get(sid, {})
+            st = int(record.get("personastate", 0) or 0)
+            if st != 0:
+                any_online = True
+                break
             off_since = parse_iso(record.get("offline_since", ""))
             if off_since:
                 mins = (datetime.now() - off_since).total_seconds() / 60.0
                 if mins > offline_minutes_max:
                     offline_minutes_max = mins
 
+        if any_online:
+            return max(10, default_sec)
         if offline_minutes_max >= 30:
             return 600
         if offline_minutes_max >= 10:
@@ -592,7 +652,7 @@ class SteamFriendMonitor(Star):
                             except Exception as e:
                                 logger.error(f"[steam-monitor] push failed {umo}: {e}")
 
-                next_sleep = self._compute_next_interval(players, default_interval)
+                next_sleep = self._compute_next_interval(steam_ids, default_interval)
                 logger.info(f"[steam-monitor] next poll in {next_sleep}s")
                 await asyncio.sleep(next_sleep)
             except asyncio.CancelledError:
@@ -702,6 +762,10 @@ class SteamFriendMonitor(Star):
 
     @filter.command("sfm_status")
     async def status(self, event: AstrMessageEvent):
+
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
         steam_ids = parse_ids(self.config.get("steam_ids", ""))
         if not steam_ids:
             yield event.plain_result("未配置 steam_ids")
@@ -731,6 +795,10 @@ class SteamFriendMonitor(Star):
 
     @filter.command("sfm_test")
     async def steam_monitor_test(self, event: AstrMessageEvent, action: str = "all"):
+
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
         action = (action or "all").strip().lower()
         steam_ids = parse_ids(self.config.get("steam_ids", ""))
         targets = self._get_targets()
