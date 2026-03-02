@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import ipaddress
 import json
+import socket
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -122,6 +123,7 @@ class SteamFriendMonitor(Star):
         self.http: httpx.AsyncClient | None = None
         self.bytes_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self.icon_url_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self._config_lock = asyncio.Lock()
 
     async def initialize(self):
         self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
@@ -162,6 +164,36 @@ class SteamFriendMonitor(Star):
         except Exception as e:
             logger.warning(f"[steam-monitor] save config failed: {e}")
 
+    async def _update_config_atomic(self, key: str, value: str):
+        async with self._config_lock:
+            self.config[key] = value
+            self._save_config_safe()
+
+    async def _update_targets_atomic(self, targets: List[str]):
+        async with self._config_lock:
+            await self._update_targets_atomic(targets)
+
+    def _is_host_resolved_private(self, host: str) -> bool:
+        host = (host or "").strip()
+        if not host:
+            return True
+        with contextlib.suppress(Exception):
+            infos = socket.getaddrinfo(host, None)
+            for info in infos:
+                ip_str = info[4][0]
+                with contextlib.suppress(Exception):
+                    ip = ipaddress.ip_address(ip_str)
+                    if (
+                        ip.is_loopback
+                        or ip.is_private
+                        or ip.is_link_local
+                        or ip.is_reserved
+                        or ip.is_multicast
+                        or ip.is_unspecified
+                    ):
+                        return True
+        return False
+
     async def _delayed_unlink(self, image_path: str, delay_sec: int = 30):
         await asyncio.sleep(max(1, delay_sec))
         with contextlib.suppress(Exception):
@@ -200,6 +232,10 @@ class SteamFriendMonitor(Star):
     def _get_targets(self) -> List[str]:
         cfg_targets = parse_ids(self.config.get("push_targets", ""))
         legacy_targets = self.state.get("_push_targets", [])
+        if not isinstance(legacy_targets, list):
+            logger.warning("[steam-monitor] invalid legacy _push_targets type; ignored")
+            legacy_targets = []
+        legacy_targets = [x for x in legacy_targets if isinstance(x, str)]
         return _dedup_keep_order(cfg_targets + legacy_targets)
 
     def _set_targets(self, targets: List[str]):
@@ -299,6 +335,8 @@ class SteamFriendMonitor(Star):
                 return False
             if self._is_private_host(host):
                 return False
+            if self._is_host_resolved_private(host):
+                return False
 
             strict = bool(self.config.get("strict_remote_host", False))
             if not strict:
@@ -337,42 +375,66 @@ class SteamFriendMonitor(Star):
         if proxy_prefix:
             candidates.append(self._with_image_proxy(url, proxy_prefix))
 
-        for u in candidates:
-            if not self._is_allowed_remote_url(u):
-                logger.debug(f"[steam-monitor] blocked remote url: {u}")
+        max_redirects = max(0, int(self.config.get("max_redirects", 3) or 3))
+
+        for origin in candidates:
+            current = origin
+            if not self._is_allowed_remote_url(current):
+                logger.debug(f"[steam-monitor] blocked remote url: {current}")
                 continue
+
             try:
-                async with self.http.stream("GET", u) as resp:
-                    if resp.status_code != 200:
-                        continue
+                for _ in range(max_redirects + 1):
+                    async with self.http.stream(
+                        "GET", current, follow_redirects=False
+                    ) as resp:
+                        # redirect handling with per-hop validation
+                        if resp.status_code in (301, 302, 303, 307, 308):
+                            location = resp.headers.get("location")
+                            if not location:
+                                break
+                            next_url = str(httpx.URL(location, base=resp.request.url))
+                            if not self._is_allowed_remote_url(next_url):
+                                logger.warning(
+                                    f"[steam-monitor] blocked redirect target: {next_url}"
+                                )
+                                break
+                            current = next_url
+                            continue
 
-                    ctype = (resp.headers.get("content-type") or "").lower()
-                    if allowed_types and not any(
-                        ctype.startswith(x) for x in allowed_types
-                    ):
-                        continue
-
-                    clen = resp.headers.get("content-length")
-                    if clen:
-                        with contextlib.suppress(Exception):
-                            if int(clen) > max_bytes:
-                                continue
-
-                    buf = bytearray()
-                    async for chunk in resp.aiter_bytes(65536):
-                        buf.extend(chunk)
-                        if len(buf) > max_bytes:
-                            buf = bytearray()
+                        if resp.status_code != 200:
                             break
 
-                    if not buf:
-                        continue
+                        ctype = (resp.headers.get("content-type") or "").lower()
+                        if allowed_types and not any(
+                            ctype.startswith(x) for x in allowed_types
+                        ):
+                            break
 
-                    raw = bytes(buf)
-                    self._cache_set(self.bytes_cache, url, raw, "bytes")
-                    return raw
+                        clen = resp.headers.get("content-length")
+                        if clen:
+                            with contextlib.suppress(Exception):
+                                if int(clen) > max_bytes:
+                                    break
+
+                        buf = bytearray()
+                        async for chunk in resp.aiter_bytes(65536):
+                            buf.extend(chunk)
+                            if len(buf) > max_bytes:
+                                buf = bytearray()
+                                break
+
+                        if not buf:
+                            break
+
+                        raw = bytes(buf)
+                        self._cache_set(self.bytes_cache, url, raw, "bytes")
+                        return raw
+                    break
             except Exception as e:
-                logger.debug(f"[steam-monitor] fetch image bytes failed: {u} err={e}")
+                logger.debug(
+                    f"[steam-monitor] fetch image bytes failed: {origin} err={e}"
+                )
 
         return None
 
@@ -709,6 +771,10 @@ class SteamFriendMonitor(Star):
                     with contextlib.suppress(Exception):
                         Path(image_path).unlink(missing_ok=True)
 
+    def _validate_steam_id64(self, sid: str) -> bool:
+        sid = (sid or "").strip()
+        return sid.isdigit() and len(sid) >= 10
+
     @filter.command("sfm_bind")
     async def bind_group(self, event: AstrMessageEvent):
 
@@ -719,7 +785,7 @@ class SteamFriendMonitor(Star):
         targets = self._get_targets()
         if umo not in targets:
             targets.append(umo)
-            self._set_targets(targets)
+            await self._update_targets_atomic(targets)
         yield event.plain_result(
             "已绑定当前会话为 Steam 监控推送目标（可在配置页 push_targets 查看）"
         )
@@ -756,15 +822,14 @@ class SteamFriendMonitor(Star):
             yield event.plain_result("无权限执行该命令")
             return
         steam_id64 = (steam_id64 or "").strip()
-        if not steam_id64.isdigit() or len(steam_id64) < 10:
+        if not self._validate_steam_id64(steam_id64):
             yield event.plain_result("SteamID64 格式不正确")
             return
 
         ids = parse_ids(self.config.get("steam_ids", ""))
         if steam_id64 not in ids:
             ids.append(steam_id64)
-        self.config["steam_ids"] = ",".join(ids)
-        self._save_config_safe()
+        await self._update_config_atomic("steam_ids", ",".join(ids))
         yield event.plain_result(
             f"已绑定 SteamID64: {steam_id64}，当前监控数量: {len(ids)}"
         )
@@ -779,8 +844,9 @@ class SteamFriendMonitor(Star):
         ids = parse_ids(self.config.get("steam_ids", ""))
         if steam_id64 in ids:
             ids.remove(steam_id64)
-        self.config["steam_ids"] = ",".join(ids)
-        self._save_config_safe()
+        self.state.pop(steam_id64, None)
+        self._save_state()
+        await self._update_config_atomic("steam_ids", ",".join(ids))
         yield event.plain_result(
             f"已移除 SteamID64: {steam_id64}，当前监控数量: {len(ids)}"
         )
@@ -792,9 +858,16 @@ class SteamFriendMonitor(Star):
             yield event.plain_result("无权限执行该命令")
             return
         parsed = parse_ids(ids)
-        self.config["steam_ids"] = ",".join(parsed)
-        self._save_config_safe()
-        yield event.plain_result(f"已设置监控ID数量: {len(parsed)}")
+        valid = [sid for sid in parsed if self._validate_steam_id64(sid)]
+        invalid = [sid for sid in parsed if not self._validate_steam_id64(sid)]
+        await self._update_config_atomic("steam_ids", ",".join(valid))
+        if invalid:
+            yield event.plain_result(
+                f"已设置监控ID数量: {len(valid)}；忽略非法ID {len(invalid)} 个："
+                + ", ".join(invalid[:10])
+            )
+        else:
+            yield event.plain_result(f"已设置监控ID数量: {len(valid)}")
 
     @filter.command("sfm_status")
     async def status(self, event: AstrMessageEvent):
