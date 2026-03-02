@@ -8,7 +8,7 @@ from io import BytesIO
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont
@@ -219,6 +219,22 @@ class SteamFriendMonitor(Star):
         prefix = (proxy_prefix or "").strip()
         if not prefix:
             return url
+
+        # 仅允许 http/https 且禁止本地回环/文件协议，避免恶意中转配置
+        try:
+            parsed = urlparse(prefix)
+            scheme = (parsed.scheme or "").lower()
+            host = (parsed.hostname or "").lower()
+            if scheme and scheme not in ("http", "https"):
+                logger.warning(f"[steam-monitor] invalid proxy scheme: {scheme}")
+                return url
+            if host in {"localhost", "127.0.0.1", "::1"}:
+                logger.warning("[steam-monitor] blocked local proxy host")
+                return url
+        except Exception as e:
+            logger.warning(f"[steam-monitor] invalid proxy prefix: {e}")
+            return url
+
         encoded = quote(url, safe="")
         if "{url}" in prefix:
             return prefix.replace("{url}", encoded)
@@ -313,6 +329,20 @@ class SteamFriendMonitor(Star):
             logger.warning(f"[steam-monitor] parse game icon failed appid={appid}: {e}")
             return None
 
+    def _process_image_bytes(
+        self, raw: bytes, size: tuple[int, int], circle: bool = False
+    ) -> Image.Image | None:
+        try:
+            with Image.open(BytesIO(raw)) as opened:
+                img = opened.convert("RGBA")
+            img = img.resize(size, Image.Resampling.LANCZOS)
+            if circle:
+                img = circle_crop(img)
+            return img
+        except Exception as e:
+            logger.warning(f"[steam-monitor] decode image failed: {e}")
+            return None
+
     async def _load_remote_image(
         self,
         url: str,
@@ -334,15 +364,7 @@ class SteamFriendMonitor(Star):
         )
         if not raw:
             return None
-        try:
-            img = Image.open(BytesIO(raw)).convert("RGBA")
-            img = img.resize(size, Image.Resampling.LANCZOS)
-            if circle:
-                img = circle_crop(img)
-            return img
-        except Exception as e:
-            logger.warning(f"[steam-monitor] decode image failed: {e}")
-            return None
+        return await asyncio.to_thread(self._process_image_bytes, raw, size, circle)
 
     async def _prepare_assets(
         self, players: List[Dict[str, Any]]
@@ -352,7 +374,6 @@ class SteamFriendMonitor(Star):
         )
         concurrency = max(1, int(self.config.get("asset_concurrency", 6) or 6))
         sem = asyncio.Semaphore(concurrency)
-        out: Dict[str, Dict[str, Any]] = {}
 
         async def one_player(p: Dict[str, Any]):
             sid = str(p.get("steamid", ""))
@@ -373,10 +394,12 @@ class SteamFriendMonitor(Star):
                             icon_url, (180, 68), proxy_prefix
                         )
 
-            out[sid] = {"avatar": avatar, "game_icon": game_icon}
+            return sid, {"avatar": avatar, "game_icon": game_icon}
 
-        await asyncio.gather(*(one_player(p) for p in players), return_exceptions=False)
-        return out
+        pairs = await asyncio.gather(
+            *(one_player(p) for p in players), return_exceptions=False
+        )
+        return dict(pairs)
 
     def _build_status_image(
         self, players: List[Dict[str, Any]], assets: Dict[str, Dict[str, Any]]
