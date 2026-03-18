@@ -12,7 +12,7 @@ from io import BytesIO
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont
@@ -702,7 +702,7 @@ class SteamFriendMonitor(Star):
                                     f"redirect-no-location:{current}:status={resp.status_code}"
                                 )
                                 break
-                            next_url = str(httpx.URL(location, base=resp.request.url))
+                            next_url = urljoin(str(resp.request.url), location)
                             logger.debug(
                                 f"[steam-monitor] redirect: from={current} to={next_url} status={resp.status_code}"
                             )
