@@ -966,10 +966,17 @@ class SteamFriendMonitor(Star):
                 draw.ellipse((34, y + 28, 54, y + 48), fill=color)
 
             draw.text((112, y + 18), name, fill=(240, 240, 240), font=font_text)
-            line2 = f"状态: {persona_text(state)}" + (
-                f" | 游戏: {game}" if game else ""
-            )
+            line2_parts = [persona_text(state)]
+            if game:
+                line2_parts.append(game)
+            line2 = " | ".join(line2_parts)
             draw.text((112, y + 54), line2, fill=(170, 180, 190), font=font_small)
+
+            # 在线（state=1）时仅显示绿色圆点，避免与下方状态文案重复。
+            if state == 1:
+                dot_x = w - 246
+                dot_y = y + 30
+                draw.ellipse((dot_x, dot_y, dot_x + 12, dot_y + 12), fill=(67, 200, 88))
 
             game_icon = aset.get("game_icon")
             if game_icon is not None:
