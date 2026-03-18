@@ -4,6 +4,6 @@ desc: |-
   ·轮询 Steam 玩家状态（在线/离线/忙碌/离开等）
   ·玩家上线、下线、启动游戏、关闭游戏、切换游戏时自动推送图片到已绑定会话
   ·支持手动查询当前状态图
-version: 0.1.1
+version: 0.1.2
 author: FlandreSatori
 repo: https://github.com/FlandreSatori/astrbot_plugin_steam_friend_monitor
