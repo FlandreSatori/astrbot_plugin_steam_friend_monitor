@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import ipaddress
 import json
+import platform
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -128,6 +129,20 @@ class SteamFriendMonitor(Star):
     async def initialize(self):
         self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
         self._task = asyncio.create_task(self._poll_loop())
+        logger.info(
+            "[steam-monitor] runtime: "
+            f"os={platform.system()} "
+            f"release={platform.release()} "
+            f"python={platform.python_version()}"
+        )
+        logger.info(
+            "[steam-monitor] image cfg: "
+            f"image_proxy_prefix={self.config.get('image_proxy_prefix', 'https://images.weserv.nl/?url=')} "
+            f"strict_remote_host={self.config.get('strict_remote_host', False)} "
+            f"remote_host_allowlist={self.config.get('remote_host_allowlist', '')} "
+            f"max_redirects={self.config.get('max_redirects', 3)} "
+            f"max_image_bytes={self.config.get('max_image_bytes', 3 * 1024 * 1024)}"
+        )
         logger.info("[steam-monitor] initialized")
 
     async def terminate(self):
@@ -179,14 +194,25 @@ class SteamFriendMonitor(Star):
     async def _is_host_resolved_private(self, host: str) -> bool:
         host = (host or "").strip()
         if not host:
+            logger.debug("[steam-monitor] _is_host_resolved_private: empty host -> private")
             return True
         with contextlib.suppress(Exception):
             loop = asyncio.get_running_loop()
             infos = await loop.getaddrinfo(host, None)
+            logger.debug(
+                f"[steam-monitor] dns resolve host={host} resolved_count={len(infos)}"
+            )
             for info in infos:
                 ip_str = info[4][0]
                 with contextlib.suppress(Exception):
                     ip = ipaddress.ip_address(ip_str)
+                    logger.debug(
+                        "[steam-monitor] dns resolved "
+                        f"host={host} ip={ip_str} "
+                        f"loopback={ip.is_loopback} private={ip.is_private} "
+                        f"link_local={ip.is_link_local} reserved={ip.is_reserved} "
+                        f"multicast={ip.is_multicast} unspecified={ip.is_unspecified}"
+                    )
                     if (
                         ip.is_loopback
                         or ip.is_private
@@ -195,7 +221,11 @@ class SteamFriendMonitor(Star):
                         or ip.is_multicast
                         or ip.is_unspecified
                     ):
+                        logger.debug(
+                            f"[steam-monitor] host resolved to private/local ip, host={host} ip={ip_str}"
+                        )
                         return True
+        logger.debug(f"[steam-monitor] host resolved non-private host={host}")
         return False
 
     async def _delayed_unlink(self, image_path: str, delay_sec: int = 30):
@@ -333,6 +363,7 @@ class SteamFriendMonitor(Star):
     def _with_image_proxy(self, url: str, proxy_prefix: str) -> str:
         prefix = (proxy_prefix or "").strip()
         if not prefix:
+            logger.debug(f"[steam-monitor] no image proxy prefix, use origin url={url}")
             return url
 
         # 仅允许 http/https 且禁止本地回环/文件协议，避免恶意中转配置
@@ -340,6 +371,9 @@ class SteamFriendMonitor(Star):
             parsed = urlparse(prefix)
             scheme = (parsed.scheme or "").lower()
             host = (parsed.hostname or "").lower()
+            logger.debug(
+                f"[steam-monitor] validate image proxy prefix={prefix} scheme={scheme} host={host}"
+            )
             if scheme and scheme not in ("http", "https"):
                 logger.warning(f"[steam-monitor] invalid proxy scheme: {scheme}")
                 return url
@@ -352,29 +386,56 @@ class SteamFriendMonitor(Star):
 
         encoded = quote(url, safe="")
         if "{url}" in prefix:
-            return prefix.replace("{url}", encoded)
+            proxied = prefix.replace("{url}", encoded)
+            logger.debug(
+                f"[steam-monitor] proxy url built with '{{url}}': src={url} proxied={proxied}"
+            )
+            return proxied
         if "%s" in prefix:
             try:
-                return prefix % encoded
+                proxied = prefix % encoded
+                logger.debug(
+                    f"[steam-monitor] proxy url built with '%s': src={url} proxied={proxied}"
+                )
+                return proxied
             except Exception as e:
                 logger.warning(f"[steam-monitor] invalid proxy format: {e}")
                 return url
-        return prefix + encoded
+        proxied = prefix + encoded
+        logger.debug(
+            f"[steam-monitor] proxy url built by concat: src={url} proxied={proxied}"
+        )
+        return proxied
 
     async def _is_allowed_remote_url(self, url: str) -> bool:
         try:
             parsed = urlparse(url)
             scheme = (parsed.scheme or "").lower()
             host = (parsed.hostname or "").lower()
+            logger.debug(
+                f"[steam-monitor] validate remote url={url} scheme={scheme} host={host}"
+            )
             if scheme not in ("http", "https"):
+                logger.warning(
+                    f"[steam-monitor] blocked remote url by scheme: url={url} scheme={scheme}"
+                )
                 return False
             if self._is_private_host(host):
+                logger.warning(
+                    f"[steam-monitor] blocked remote url by private/local host: url={url} host={host}"
+                )
                 return False
             if await self._is_host_resolved_private(host):
+                logger.warning(
+                    f"[steam-monitor] blocked remote url by dns-resolved private ip: url={url} host={host}"
+                )
                 return False
 
             strict = bool(self.config.get("strict_remote_host", False))
             if not strict:
+                logger.debug(
+                    f"[steam-monitor] remote url allowed (strict disabled): url={url} host={host}"
+                )
                 return True
 
             custom = parse_ids(self.config.get("remote_host_allowlist", ""))
@@ -385,8 +446,15 @@ class SteamFriendMonitor(Star):
                 "akamaihd.net",
                 "images.weserv.nl",
             ] + custom
-            return any(host == d or host.endswith("." + d) for d in allow)
-        except Exception:
+            ok = any(host == d or host.endswith("." + d) for d in allow)
+            logger.debug(
+                f"[steam-monitor] strict allowlist check host={host} allowed={ok} allow={allow}"
+            )
+            return ok
+        except Exception as e:
+            logger.warning(
+                f"[steam-monitor] validate remote url exception url={url}: {e}"
+            )
             return False
 
     async def _fetch_url_bytes(
@@ -397,11 +465,16 @@ class SteamFriendMonitor(Star):
         max_bytes: int = 3 * 1024 * 1024,
     ) -> bytes | None:
         if not url:
+            logger.debug("[steam-monitor] _fetch_url_bytes skipped: empty url")
             return None
 
         cached = self._cache_get(self.bytes_cache, url)
         if cached is not None:
+            logger.debug(
+                f"[steam-monitor] bytes cache hit: url={url} size={len(cached)}"
+            )
             return cached
+        logger.debug(f"[steam-monitor] bytes cache miss: url={url}")
 
         if not self.http:
             self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
@@ -409,26 +482,49 @@ class SteamFriendMonitor(Star):
         candidates = [url]
         if proxy_prefix:
             candidates.append(self._with_image_proxy(url, proxy_prefix))
+        logger.debug(
+            f"[steam-monitor] fetch candidates for url={url}: count={len(candidates)} candidates={candidates}"
+        )
 
         max_redirects = max(0, int(self.config.get("max_redirects", 3) or 3))
+        logger.debug(
+            "[steam-monitor] fetch options: "
+            f"url={url} allowed_types={allowed_types} max_bytes={max_bytes} max_redirects={max_redirects}"
+        )
 
         for origin in candidates:
             current = origin
+            logger.debug(f"[steam-monitor] start fetch origin={origin}")
             if not await self._is_allowed_remote_url(current):
                 logger.debug(f"[steam-monitor] blocked remote url: {current}")
                 continue
 
             try:
-                for _ in range(max_redirects + 1):
+                for hop in range(max_redirects + 1):
+                    logger.debug(
+                        f"[steam-monitor] request hop={hop}/{max_redirects} current={current}"
+                    )
                     async with self.http.stream(
                         "GET", current, follow_redirects=False
                     ) as resp:
+                        logger.debug(
+                            "[steam-monitor] response received: "
+                            f"url={current} status={resp.status_code} "
+                            f"content-type={resp.headers.get('content-type', '')} "
+                            f"content-length={resp.headers.get('content-length', '')}"
+                        )
                         # redirect handling with per-hop validation
                         if resp.status_code in (301, 302, 303, 307, 308):
                             location = resp.headers.get("location")
                             if not location:
+                                logger.warning(
+                                    f"[steam-monitor] redirect without location: from={current} status={resp.status_code}"
+                                )
                                 break
                             next_url = str(httpx.URL(location, base=resp.request.url))
+                            logger.debug(
+                                f"[steam-monitor] redirect: from={current} to={next_url} status={resp.status_code}"
+                            )
                             if not await self._is_allowed_remote_url(next_url):
                                 logger.warning(
                                     f"[steam-monitor] blocked redirect target: {next_url}"
@@ -438,39 +534,61 @@ class SteamFriendMonitor(Star):
                             continue
 
                         if resp.status_code != 200:
+                            logger.warning(
+                                f"[steam-monitor] fetch non-200: url={current} status={resp.status_code}"
+                            )
                             break
 
                         ctype = (resp.headers.get("content-type") or "").lower()
                         if allowed_types and not any(
                             ctype.startswith(x) for x in allowed_types
                         ):
+                            logger.warning(
+                                f"[steam-monitor] content-type not allowed: url={current} content-type={ctype} allowed={allowed_types}"
+                            )
                             break
 
                         clen = resp.headers.get("content-length")
                         if clen:
                             with contextlib.suppress(Exception):
                                 if int(clen) > max_bytes:
+                                    logger.warning(
+                                        f"[steam-monitor] content-length too large: url={current} content-length={clen} max={max_bytes}"
+                                    )
                                     break
 
                         buf = bytearray()
                         async for chunk in resp.aiter_bytes(65536):
                             buf.extend(chunk)
                             if len(buf) > max_bytes:
+                                logger.warning(
+                                    f"[steam-monitor] streamed bytes exceeded limit: url={current} size={len(buf)} max={max_bytes}"
+                                )
                                 buf = bytearray()
                                 break
 
                         if not buf:
+                            logger.warning(
+                                f"[steam-monitor] empty body after fetch: url={current}"
+                            )
                             break
 
                         raw = bytes(buf)
                         self._cache_set(self.bytes_cache, url, raw, "bytes")
+                        logger.debug(
+                            f"[steam-monitor] fetch success: url={current} origin_key={url} size={len(raw)}"
+                        )
                         return raw
+                    logger.debug(
+                        f"[steam-monitor] stop trying current origin after hop={hop} current={current}"
+                    )
                     break
             except Exception as e:
                 logger.debug(
                     f"[steam-monitor] fetch image bytes failed: {origin} err={e}"
                 )
 
+        logger.warning(f"[steam-monitor] all fetch candidates failed: url={url}")
         return None
 
     async def _get_game_icon_url(self, appid: str) -> str | None:
@@ -478,26 +596,42 @@ class SteamFriendMonitor(Star):
             return None
         cached = self._cache_get(self.icon_url_cache, appid)
         if cached is not None:
+            logger.debug(f"[steam-monitor] game icon url cache hit: appid={appid}")
             return cached
+        logger.debug(f"[steam-monitor] game icon url cache miss: appid={appid}")
 
         api = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=schinese"
+        logger.debug(f"[steam-monitor] fetch game icon metadata appid={appid} api={api}")
         raw = await self._fetch_url_bytes(
             api,
             allowed_types=("application/json", "text/json", "text/plain"),
             max_bytes=512 * 1024,
         )
         if not raw:
+            logger.warning(
+                f"[steam-monitor] game icon metadata fetch empty appid={appid}"
+            )
             return None
 
         try:
             data = json.loads(raw.decode("utf-8", errors="ignore"))
             node = data.get(str(appid), {})
             if not node.get("success"):
+                logger.warning(
+                    f"[steam-monitor] game metadata success=false appid={appid}"
+                )
                 return None
             app = node.get("data", {})
             icon_url = app.get("header_image") or app.get("capsule_image")
             if icon_url:
                 self._cache_set(self.icon_url_cache, appid, icon_url, "icon")
+                logger.debug(
+                    f"[steam-monitor] game icon url resolved appid={appid} url={icon_url}"
+                )
+            else:
+                logger.warning(
+                    f"[steam-monitor] game icon url missing in metadata appid={appid}"
+                )
             return icon_url
         except Exception as e:
             logger.warning(f"[steam-monitor] parse game icon failed appid={appid}: {e}")
@@ -507,10 +641,17 @@ class SteamFriendMonitor(Star):
         self, raw: bytes, size: tuple[int, int], circle: bool = False
     ) -> Image.Image | None:
         try:
+            logger.debug(
+                f"[steam-monitor] decode image start bytes={len(raw)} target_size={size} circle={circle}"
+            )
             with Image.open(BytesIO(raw)) as opened:
                 max_pixels = max(
                     512 * 512,
                     int(self.config.get("max_image_pixels", 4_000_000) or 4_000_000),
+                )
+                logger.debug(
+                    "[steam-monitor] decode image metadata: "
+                    f"width={opened.width} height={opened.height} mode={opened.mode} max_pixels={max_pixels}"
                 )
                 if opened.width * opened.height > max_pixels:
                     logger.warning(
@@ -521,6 +662,9 @@ class SteamFriendMonitor(Star):
             img = img.resize(size, Image.Resampling.LANCZOS)
             if circle:
                 img = circle_crop(img)
+            logger.debug(
+                f"[steam-monitor] decode image success target_size={size} circle={circle}"
+            )
             return img
         except Exception as e:
             logger.warning(f"[steam-monitor] decode image failed: {e}")
@@ -533,6 +677,9 @@ class SteamFriendMonitor(Star):
         proxy_prefix: str = "",
         circle: bool = False,
     ) -> Image.Image | None:
+        logger.debug(
+            f"[steam-monitor] load remote image start url={url} size={size} circle={circle} proxy_prefix={proxy_prefix}"
+        )
         raw = await self._fetch_url_bytes(
             url,
             proxy_prefix=proxy_prefix,
@@ -546,8 +693,16 @@ class SteamFriendMonitor(Star):
             ),
         )
         if not raw:
+            logger.warning(
+                f"[steam-monitor] load remote image failed to fetch bytes url={url}"
+            )
             return None
-        return await asyncio.to_thread(self._process_image_bytes, raw, size, circle)
+        img = await asyncio.to_thread(self._process_image_bytes, raw, size, circle)
+        if img is None:
+            logger.warning(f"[steam-monitor] load remote image decode failed url={url}")
+        else:
+            logger.debug(f"[steam-monitor] load remote image success url={url}")
+        return img
 
     async def _prepare_assets(
         self, players: List[Dict[str, Any]]
@@ -556,32 +711,58 @@ class SteamFriendMonitor(Star):
             "image_proxy_prefix", "https://images.weserv.nl/?url="
         )
         concurrency = max(1, int(self.config.get("asset_concurrency", 6) or 6))
+        logger.info(
+            f"[steam-monitor] prepare assets start players={len(players)} proxy_prefix={proxy_prefix} concurrency={concurrency}"
+        )
         sem = asyncio.Semaphore(concurrency)
 
         async def one_player(p: Dict[str, Any]):
             sid = str(p.get("steamid", ""))
             avatar_url = p.get("avatarfull") or p.get("avatarmedium") or p.get("avatar")
             gameid = str(p.get("gameid", "") or "").strip()
+            logger.debug(
+                f"[steam-monitor] prepare one player sid={sid} avatar_url={avatar_url} gameid={gameid}"
+            )
 
             async with sem:
                 avatar = await self._load_remote_image(
                     avatar_url or "", (64, 64), proxy_prefix, circle=True
                 )
+            if avatar is None:
+                logger.warning(
+                    f"[steam-monitor] avatar load failed sid={sid} avatar_url={avatar_url}"
+                )
+            else:
+                logger.debug(f"[steam-monitor] avatar load ok sid={sid}")
 
             game_icon = None
             if gameid:
                 async with sem:
                     icon_url = await self._get_game_icon_url(gameid)
+                logger.debug(
+                    f"[steam-monitor] game icon metadata sid={sid} gameid={gameid} icon_url={icon_url}"
+                )
                 if icon_url:
                     async with sem:
                         game_icon = await self._load_remote_image(
                             icon_url, (180, 68), proxy_prefix
+                        )
+                    if game_icon is None:
+                        logger.warning(
+                            f"[steam-monitor] game icon load failed sid={sid} gameid={gameid} icon_url={icon_url}"
+                        )
+                    else:
+                        logger.debug(
+                            f"[steam-monitor] game icon load ok sid={sid} gameid={gameid}"
                         )
 
             return sid, {"avatar": avatar, "game_icon": game_icon}
 
         pairs = await asyncio.gather(
             *(one_player(p) for p in players), return_exceptions=False
+        )
+        logger.info(
+            f"[steam-monitor] prepare assets done players={len(players)} pairs={len(pairs)}"
         )
         return dict(pairs)
 
@@ -649,10 +830,16 @@ class SteamFriendMonitor(Star):
             img.close()
 
     async def _render_status_image(self, players: List[Dict[str, Any]]) -> str:
+        logger.info(f"[steam-monitor] render status image start players={len(players)}")
         assets = await self._prepare_assets(players)
-        return await asyncio.to_thread(self._build_status_image, players, assets)
+        out = await asyncio.to_thread(self._build_status_image, players, assets)
+        logger.info(f"[steam-monitor] render status image done output={out}")
+        return out
 
     async def _push_image(self, umo: str, text: str, image_path: str):
+        logger.info(
+            f"[steam-monitor] push image start target={umo} image_path={image_path} text_len={len(text or '')}"
+        )
         chain = MessageChain()
         items = []
         if (text or "").strip():
@@ -660,6 +847,7 @@ class SteamFriendMonitor(Star):
         items.append(Comp.Image.fromFileSystem(image_path))
         chain.chain = items
         await self.context.send_message(umo, chain)
+        logger.info(f"[steam-monitor] push image success target={umo} image_path={image_path}")
 
     def _compute_next_interval(self, steam_ids: List[str], default_sec: int) -> int:
         # 基于完整监控集合（配置 ID + state）计算，而不是仅 API 返回列表
@@ -762,18 +950,18 @@ class SteamFriendMonitor(Star):
 
                     name = p.get("personaname", "?")
                     if prev == 0 and st != 0:
-                        events.append(f"{name}: 上线 ({persona_text(st)})")
+                        events.append(f"{name} 上线 ({persona_text(st)})")
                     elif prev != 0 and st == 0:
-                        events.append(f"{name}: 下线")
+                        events.append(f"{name} 下线")
 
                     if st != 0:
                         if not prev_game and game:
-                            events.append(f"{name}: 启动游戏《{game}》")
+                            events.append(f"{name} 启动游戏《{game}》")
                         elif prev_game and not game:
-                            events.append(f"{name}: 关闭游戏《{prev_game}》")
+                            events.append(f"{name} 关闭游戏《{prev_game}》")
                         elif prev_game and game and prev_game != game:
                             events.append(
-                                f"{name}: 切换游戏《{prev_game}》 -> 《{game}》"
+                                f"{name} 切换游戏《{prev_game}》 -> 《{game}》"
                             )
 
                 self._save_state()
@@ -783,7 +971,7 @@ class SteamFriendMonitor(Star):
                     image_path = await self._render_status_image(ordered_players)
                     targets = self._get_targets()
                     if targets:
-                        text = "Steam 状态变化：" + chr(10) + chr(10).join(events)
+                        text = "" + chr(10) + chr(10).join(events)
                         for umo in targets:
                             try:
                                 await self._push_image(umo, text, image_path)
