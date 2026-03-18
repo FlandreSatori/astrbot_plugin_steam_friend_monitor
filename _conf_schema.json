@@ -26,6 +26,12 @@
     "type": "int",
     "default": 0
   },
+  "status_text_trigger_types": {
+    "description": "触发状态文字推送的事件类型（逗号分隔，可多选或留空）",
+    "type": "string",
+    "default": "online,offline,game_start,game_stop,game_switch",
+    "hint": "可选值：online,offline,game_start,game_stop,game_switch；留空表示不因事件自动推送状态文字"
+  },
   "status_image_trigger_types": {
     "description": "触发状态图片推送的事件类型（逗号分隔，可多选或留空）",
     "type": "string",
@@ -36,6 +42,12 @@
     "description": "仅在离线->在线时推送（true）",
     "type": "bool",
     "default": true
+  },
+  "enable_profile_game_fallback": {
+    "description": "当 API 未返回游戏名时，尝试从个人资料页面兜底读取（支持部分非 Steam 游戏）",
+    "type": "bool",
+    "default": true,
+    "hint": "依赖 steamcommunity.com 个人资料可访问；若不希望额外请求可关闭"
   },
   "image_proxy_prefix": {
     "description": "图片中转前缀（用于头像/游戏图标）",

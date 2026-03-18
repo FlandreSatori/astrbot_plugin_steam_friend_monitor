@@ -4,6 +4,7 @@ import ipaddress
 import json
 import platform
 import time
+import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from datetime import datetime
 from io import BytesIO
@@ -125,6 +126,7 @@ class SteamFriendMonitor(Star):
         self.http: httpx.AsyncClient | None = None
         self.bytes_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self.icon_url_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self.profile_game_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._config_lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task] = set()
 
@@ -236,7 +238,9 @@ class SteamFriendMonitor(Star):
             int(self.config.get("status_image_min_interval_min", 0) or 0),
         )
 
-    def _status_image_trigger_types(self) -> set[str]:
+    def _parse_trigger_types_config(
+        self, config_key: str, default_value: str
+    ) -> set[str]:
         allowed = {
             "online",
             "offline",
@@ -246,10 +250,22 @@ class SteamFriendMonitor(Star):
         }
         configured = {
             x.strip().lower()
-            for x in parse_ids(self.config.get("status_image_trigger_types", ""))
+            for x in parse_ids(self.config.get(config_key, default_value))
             if x.strip()
         }
         return configured & allowed
+
+    def _status_text_trigger_types(self) -> set[str]:
+        return self._parse_trigger_types_config(
+            "status_text_trigger_types",
+            "online,offline,game_start,game_stop,game_switch",
+        )
+
+    def _status_image_trigger_types(self) -> set[str]:
+        return self._parse_trigger_types_config(
+            "status_image_trigger_types",
+            "online,offline,game_start,game_stop,game_switch",
+        )
 
     def _normalize_target_key(self, target: str) -> str:
         return str(target or "").strip()
@@ -350,6 +366,11 @@ class SteamFriendMonitor(Star):
     def _cache_limit(self, kind: str) -> int:
         if kind == "bytes":
             return max(100, int(self.config.get("cache_max_bytes_items", 512) or 512))
+        if kind == "profile_game":
+            return max(
+                100,
+                int(self.config.get("cache_max_profile_game_items", 1024) or 1024),
+            )
         return max(100, int(self.config.get("cache_max_icon_items", 1024) or 1024))
 
     def _cache_get(self, cache: OrderedDict, key: str):
@@ -796,6 +817,48 @@ class SteamFriendMonitor(Star):
             logger.warning(f"[steam-monitor] parse game icon failed appid={appid}: {e}")
             return None
 
+    def _profile_game_fallback_enabled(self) -> bool:
+        return bool(self.config.get("enable_profile_game_fallback", True))
+
+    async def _get_profile_game_name_fallback(self, steamid: str) -> str:
+        """当 API 未返回 gameextrainfo 时，从个人资料 XML 兜底读取游戏名。"""
+        steamid = (steamid or "").strip()
+        if not steamid:
+            return ""
+
+        cached = self._cache_get(self.profile_game_cache, steamid)
+        if cached is not None:
+            return str(cached or "").strip()
+
+        profile_xml_url = f"https://steamcommunity.com/profiles/{steamid}/?xml=1"
+        raw = await self._fetch_url_bytes(
+            profile_xml_url,
+            allowed_types=("text/", "application/xml"),
+            max_bytes=256 * 1024,
+        )
+        if not raw:
+            self._cache_set(self.profile_game_cache, steamid, "", "profile_game")
+            return ""
+
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+            root = ET.fromstring(text)
+            game_name = (root.findtext(".//inGameInfo/gameName") or "").strip()
+            self._cache_set(
+                self.profile_game_cache, steamid, game_name, "profile_game"
+            )
+            if game_name:
+                logger.debug(
+                    f"[steam-monitor] profile fallback game name resolved steamid={steamid} game={game_name}"
+                )
+            return game_name
+        except Exception as e:
+            logger.debug(
+                f"[steam-monitor] profile fallback parse failed steamid={steamid}: {e}"
+            )
+            self._cache_set(self.profile_game_cache, steamid, "", "profile_game")
+            return ""
+
     def _process_image_bytes(
         self, raw: bytes, size: tuple[int, int], circle: bool = False
     ) -> Image.Image | None:
@@ -1051,6 +1114,16 @@ class SteamFriendMonitor(Star):
         await self.context.send_message(umo, image_chain)
         logger.info(f"[steam-monitor] push image success target={umo} image_path={image_path}")
 
+    async def _push_text(self, umo: str, text: str):
+        clean_text = "\n".join(
+            line.strip() for line in (text or "").splitlines() if line.strip()
+        )
+        if not clean_text:
+            return
+        chain = MessageChain()
+        chain.chain = [Comp.Plain(text=clean_text)]
+        await self.context.send_message(umo, chain)
+
     def _compute_next_interval(self, steam_ids: List[str], default_sec: int) -> int:
         # 基于完整监控集合（配置 ID + state）计算，而不是仅 API 返回列表
         all_ids = _dedup_keep_order(
@@ -1192,6 +1265,10 @@ class SteamFriendMonitor(Star):
 
                 st = int(p.get("personastate", 0))
                 game = (p.get("gameextrainfo", "") or "").strip()
+                if st != 0 and not game and self._profile_game_fallback_enabled():
+                    fallback_game = await self._get_profile_game_name_fallback(sid)
+                    if fallback_game:
+                        game = fallback_game
 
                 prev_record = target_state.get(sid, {})
                 prev = prev_record.get("personastate")
@@ -1242,23 +1319,26 @@ class SteamFriendMonitor(Star):
             self._save_state()
 
             if events:
-                trigger_types = self._status_image_trigger_types()
-                if not trigger_types:
-                    logger.info(
-                        "[steam-monitor] status image push skipped: status_image_trigger_types is empty"
-                    )
-                    return
+                text_trigger_types = self._status_text_trigger_types()
+                image_trigger_types = self._status_image_trigger_types()
+                send_text = bool(event_types & text_trigger_types)
+                send_image = bool(event_types & image_trigger_types)
 
-                matched_types = event_types & trigger_types
-                if not matched_types:
+                if not send_text and not send_image:
                     logger.debug(
-                        "[steam-monitor] status image push skipped by trigger types: "
-                        f"event_types={sorted(event_types)} trigger_types={sorted(trigger_types)}"
+                        "[steam-monitor] event push skipped by trigger types: "
+                        f"event_types={sorted(event_types)} "
+                        f"text_trigger_types={sorted(text_trigger_types)} "
+                        f"image_trigger_types={sorted(image_trigger_types)}"
                     )
                     return
 
-                min_interval = self._status_image_min_interval_min()
-                if min_interval > 0:
+                if send_image:
+                    min_interval = self._status_image_min_interval_min()
+                else:
+                    min_interval = 0
+
+                if send_image and min_interval > 0:
                     now_ts = time.time()
                     last_push_ts = self._get_target_last_push_ts(target)
                     if last_push_ts > 0 and (now_ts - last_push_ts) < min_interval * 60:
@@ -1267,15 +1347,24 @@ class SteamFriendMonitor(Star):
                             "[steam-monitor] status image push skipped by interval limit: "
                             f"target={target} target_key={target_key} min_interval={min_interval}"
                         )
-                        return
+                        send_image = False
 
-                ordered_players = self._order_players_by_ids(players, steam_ids)
-                image_path = await self._render_status_image(ordered_players)
+                if not send_text and not send_image:
+                    return
+
                 text = chr(10).join(events)
                 try:
-                    await self._push_image(target, text, image_path)
-                    self._set_target_last_push_ts(target, time.time())
-                    self._save_state()
+                    if send_image:
+                        ordered_players = self._order_players_by_ids(players, steam_ids)
+                        image_path = await self._render_status_image(ordered_players)
+                        if send_text:
+                            await self._push_image(target, text, image_path)
+                        else:
+                            await self._push_image(target, "", image_path)
+                        self._set_target_last_push_ts(target, time.time())
+                        self._save_state()
+                    else:
+                        await self._push_text(target, text)
                 except Exception as e:
                     logger.error(f"[steam-monitor] push failed {target}: {e}")
         finally:
