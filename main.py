@@ -1493,3 +1493,53 @@ class SteamFriendMonitor(Star):
             yield event.plain_result("[当前群] 已清除独立设置，将使用全局监控配置")
         else:
             yield event.plain_result("[当前群] 未设置独立监控，无需清除")
+
+    @filter.command("sfm_debug_group")
+    async def debug_group(self, event: AstrMessageEvent):
+        """诊断当前群的配置状态"""
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+        
+        group_id = event.unified_msg_origin
+        targets = self._get_targets()
+        group_ids = self._get_group_steam_ids(group_id)
+        global_ids = parse_ids(self.config.get("steam_ids", ""))
+        
+        msg = [
+            "=== 群配置诊断 ===",
+            f"当前群 ID: {group_id}",
+            f"在推送目标中? {'✓ 是' if group_id in targets else '✗ 否'}",
+            f"有独立配置? {'✓ 是' if group_ids is not None else '✗ 否'}",
+            "",
+            f"统计信息:",
+            f"  推送目标数: {len(targets)}",
+            f"  全局 IDs: {len(global_ids)}",
+            f"  群独立 IDs: {len(group_ids) if group_ids else 0}",
+            "",
+        ]
+        
+        # 详细显示全局和群配置
+        if global_ids:
+            msg.append(f"全局 steam_ids: {', '.join(global_ids[:3])}" + 
+                      (f" 等({len(global_ids)}个)" if len(global_ids) > 3 else ""))
+        
+        if group_ids:
+            msg.append(f"群独立 IDs: {', '.join(group_ids[:3])}" + 
+                      (f" 等({len(group_ids)}个)" if len(group_ids) > 3 else ""))
+        
+        # 排查建议
+        msg.extend(["", "排查指南:"])
+        if group_id not in targets:
+            msg.append("❌ 本群未绑定 → 先执行 /sfm_bind")
+        else:
+            msg.append("✓ 本群已绑定")
+        
+        if group_ids is None:
+            msg.append("⚠  无独立配置 → 使用全局")
+            if not global_ids:
+                msg.append("⚠  全局也无设置 → 执行 /sfm_set_ids")
+        else:
+            msg.append(f"✓ 有独立配置")
+        
+        yield event.plain_result(chr(10).join(msg))
