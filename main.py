@@ -1411,27 +1411,40 @@ class SteamFriendMonitor(Star):
             yield event.plain_result(f"[当前群] 已设置监控ID数量: {len(valid)}")
 
     @filter.command("sfm_add_group_id")
-    async def add_group_id(self, event: AstrMessageEvent, steam_id64: str):
-        """为当前群添加一个监控 ID"""
+    async def add_group_id(self, event: AstrMessageEvent, ids: str):
+        """为当前群添加监控 ID（支持逗号/换行批量）"""
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
-        
-        steam_id64 = (steam_id64 or "").strip()
-        if not self._validate_steam_id64(steam_id64):
-            yield event.plain_result("SteamID64 格式不正确")
+
+        parsed = parse_ids(ids)
+        valid = [sid for sid in parsed if self._validate_steam_id64(sid)]
+        invalid = [sid for sid in parsed if not self._validate_steam_id64(sid)]
+        if not valid:
+            yield event.plain_result("未添加任何有效的 SteamID64")
             return
-        
+
         group_id = event.unified_msg_origin
-        ids = self._get_group_steam_ids(group_id) or []
-        
-        if steam_id64 not in ids:
-            ids.append(steam_id64)
-        
-        await self._update_group_steam_ids_atomic(group_id, ids)
-        yield event.plain_result(
-            f"[当前群] 已添加 SteamID64: {steam_id64}，当前监控数量: {len(ids)}"
+        current_ids = self._get_group_steam_ids(group_id) or []
+
+        added = 0
+        for sid in valid:
+            if sid not in current_ids:
+                current_ids.append(sid)
+                added += 1
+
+        await self._update_group_steam_ids_atomic(group_id, current_ids)
+
+        msg = (
+            f"[当前群] 批量添加完成：新增 {added} 个，"
+            f"当前监控数量: {len(current_ids)}"
         )
+        if invalid:
+            msg += (
+                f"；忽略非法ID {len(invalid)} 个："
+                + ", ".join(invalid[:10])
+            )
+        yield event.plain_result(msg)
 
     @filter.command("sfm_del_group_id")
     async def del_group_id(self, event: AstrMessageEvent, steam_id64: str):
