@@ -38,13 +38,8 @@
     "default": "online,offline,game_start,game_stop,game_switch",
     "hint": "可选值：online,offline,game_start,game_stop,game_switch；留空表示不因事件自动推送状态图片"
   },
-  "online_only": {
-    "description": "仅在离线->在线时推送（true）",
-    "type": "bool",
-    "default": true
-  },
   "enable_profile_game_fallback": {
-    "description": "当 API 未返回游戏名时，尝试从个人资料页面兜底读取（支持部分非 Steam 游戏）",
+    "description": "当 API 未返回游戏名时，尝试从个人资料页面读取（支持部分非 Steam 游戏）",
     "type": "bool",
     "default": true,
     "hint": "依赖 steamcommunity.com 个人资料可访问；若不希望额外请求可关闭"
@@ -56,9 +51,9 @@
     "hint": "留空为直连；可用 {url} 或 %s 占位，例如 https://images.weserv.nl/?url= 或 https://your-proxy/fetch?url={url}"
   },
   "allow_dns_private_for_allow_domains": {
-    "description": "允许对白名单域名跳过 DNS 私网解析拦截",
+    "description": "允许对白名单域名跳过内网解析拦截",
     "type": "bool",
     "default": true,
-    "hint": "用于修复部分网络环境下 Steam 官方域名被 DNS 污染/劫持为私网地址导致的误拦截；关闭后将恢复严格拦截"
+    "hint": "用于修复部分网络环境下 Steam 域名被 DNS污染/代理 为私网地址导致的误拦截；关闭后将恢复严格拦截"
   }
 }

@@ -1,10 +1,11 @@
 import asyncio
 import contextlib
+import html
 import ipaddress
 import json
 import platform
+import re
 import time
-import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from datetime import datetime
 from io import BytesIO
@@ -821,7 +822,7 @@ class SteamFriendMonitor(Star):
         return bool(self.config.get("enable_profile_game_fallback", True))
 
     async def _get_profile_game_name_fallback(self, steamid: str) -> str:
-        """当 API 未返回 gameextrainfo 时，从个人资料 XML 兜底读取游戏名。"""
+        """当 API 未返回 gameextrainfo 时，从个人资料 HTML 状态区兜底读取游戏名。"""
         steamid = (steamid or "").strip()
         if not steamid:
             return ""
@@ -830,20 +831,50 @@ class SteamFriendMonitor(Star):
         if cached is not None:
             return str(cached or "").strip()
 
-        profile_xml_url = f"https://steamcommunity.com/profiles/{steamid}/?xml=1"
+        profile_url = f"https://steamcommunity.com/profiles/{steamid}/"
         raw = await self._fetch_url_bytes(
-            profile_xml_url,
-            allowed_types=("text/", "application/xml"),
-            max_bytes=256 * 1024,
+            profile_url,
+            allowed_types=("text/", "application/xhtml+xml"),
+            max_bytes=1024 * 1024,
         )
         if not raw:
             self._cache_set(self.profile_game_cache, steamid, "", "profile_game")
             return ""
 
         try:
-            text = raw.decode("utf-8", errors="ignore")
-            root = ET.fromstring(text)
-            game_name = (root.findtext(".//inGameInfo/gameName") or "").strip()
+            page = raw.decode("utf-8", errors="ignore")
+
+            # 只提取 profile_in_game_name（按当前需求，不做其他回退）。
+            in_game_match = re.search(
+                r'<div[^>]*class="[^"]*profile_in_game_name[^"]*"[^>]*>(.*?)</div>',
+                page,
+                re.I | re.S,
+            )
+            status_html = in_game_match.group(1) if in_game_match else ""
+
+            state_message = html.unescape(status_html)
+            state_message = re.sub(r"<[^>]+>", " ", state_message)
+            state_message = re.sub(r"\s+", " ", state_message).strip()
+
+            generic_markers = {
+                "In non-Steam game",
+                "Online",
+                "Offline",
+                "Away",
+                "Busy",
+                "Snooze",
+                "Looking to trade",
+                "Looking to play",
+            }
+            if state_message in generic_markers:
+                game_name = ""
+            else:
+                m = re.match(r"^(?:In-Game|In game)\s+(.+)$", state_message, re.I)
+                if m:
+                    game_name = m.group(1).strip()
+                else:
+                    game_name = state_message
+
             self._cache_set(
                 self.profile_game_cache, steamid, game_name, "profile_game"
             )
