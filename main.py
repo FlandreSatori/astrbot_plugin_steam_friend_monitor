@@ -251,20 +251,51 @@ class SteamFriendMonitor(Star):
         }
         return configured & allowed
 
+    def _normalize_target_key(self, target: str) -> str:
+        return str(target or "").strip()
+
     def _get_target_last_push_ts(self, target: str) -> float:
-        data = self.state.get("_target_last_push_ts", {})
-        if not isinstance(data, dict):
+        key = self._normalize_target_key(target)
+        if not key:
             return 0.0
-        with contextlib.suppress(Exception):
-            return float(data.get(target, 0.0) or 0.0)
+
+        # 新字段：按群独立冷却时间
+        data = self.state.get("_group_last_push_ts", {})
+        if isinstance(data, dict):
+            with contextlib.suppress(Exception):
+                return float(data.get(key, 0.0) or 0.0)
+
+        # 兼容旧字段，避免升级后冷却状态丢失
+        legacy = self.state.get("_target_last_push_ts", {})
+        if isinstance(legacy, dict):
+            with contextlib.suppress(Exception):
+                return float(legacy.get(key, 0.0) or 0.0)
         return 0.0
 
     def _set_target_last_push_ts(self, target: str, ts: float):
-        data = self.state.get("_target_last_push_ts")
+        key = self._normalize_target_key(target)
+        if not key:
+            return
+
+        data = self.state.get("_group_last_push_ts")
         if not isinstance(data, dict):
             data = {}
-            self.state["_target_last_push_ts"] = data
-        data[str(target)] = float(ts)
+            self.state["_group_last_push_ts"] = data
+        data[key] = float(ts)
+
+    def _get_target_player_state(self, target: str) -> Dict[str, Any]:
+        """获取按群隔离的玩家状态快照，用于事件判定。"""
+        key = self._normalize_target_key(target)
+        all_target_state = self.state.get("_target_player_state")
+        if not isinstance(all_target_state, dict):
+            all_target_state = {}
+            self.state["_target_player_state"] = all_target_state
+
+        one_target_state = all_target_state.get(key)
+        if not isinstance(one_target_state, dict):
+            one_target_state = {}
+            all_target_state[key] = one_target_state
+        return one_target_state
 
     async def _is_host_resolved_private(self, host: str) -> bool:
         host = (host or "").strip()
@@ -1126,6 +1157,7 @@ class SteamFriendMonitor(Star):
         try:
             players = await self._fetch_players(steam_ids)
             player_map = {str(p.get("steamid", "")): p for p in players}
+            target_state = self._get_target_player_state(target)
 
             events: List[str] = []
             event_types: set[str] = set()
@@ -1133,10 +1165,10 @@ class SteamFriendMonitor(Star):
             for sid in steam_ids:
                 p = player_map.get(sid)
                 if p is None:
-                    prev_record = self.state.get(sid, {})
+                    prev_record = target_state.get(sid, {})
                     prev = prev_record.get("personastate")
                     prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
-                    self.state[sid] = {
+                    next_record = {
                         "personaname": prev_record.get("personaname", sid),
                         "personastate": 0,
                         "gameextrainfo": "",
@@ -1144,6 +1176,8 @@ class SteamFriendMonitor(Star):
                         "ts": now,
                         "missing": True,
                     }
+                    target_state[sid] = next_record
+                    self.state[sid] = next_record
                     if prev is not None and prev != 0:
                         events.append(
                             f"{prev_record.get('personaname', sid)}: 下线（接口未返回）"
@@ -1159,7 +1193,7 @@ class SteamFriendMonitor(Star):
                 st = int(p.get("personastate", 0))
                 game = (p.get("gameextrainfo", "") or "").strip()
 
-                prev_record = self.state.get(sid, {})
+                prev_record = target_state.get(sid, {})
                 prev = prev_record.get("personastate")
                 prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
 
@@ -1170,7 +1204,7 @@ class SteamFriendMonitor(Star):
                 else:
                     offline_since = ""
 
-                self.state[sid] = {
+                next_record = {
                     "personaname": p.get("personaname", ""),
                     "personastate": st,
                     "gameextrainfo": game,
@@ -1178,6 +1212,8 @@ class SteamFriendMonitor(Star):
                     "ts": now,
                     "missing": False,
                 }
+                target_state[sid] = next_record
+                self.state[sid] = next_record
 
                 if prev is None:
                     continue
@@ -1226,9 +1262,10 @@ class SteamFriendMonitor(Star):
                     now_ts = time.time()
                     last_push_ts = self._get_target_last_push_ts(target)
                     if last_push_ts > 0 and (now_ts - last_push_ts) < min_interval * 60:
+                        target_key = self._normalize_target_key(target)
                         logger.info(
                             "[steam-monitor] status image push skipped by interval limit: "
-                            f"target={target} min_interval={min_interval}"
+                            f"target={target} target_key={target_key} min_interval={min_interval}"
                         )
                         return
 
