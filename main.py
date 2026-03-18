@@ -360,6 +360,27 @@ class SteamFriendMonitor(Star):
             )
             return host.endswith(bad_suffixes)
 
+    def _remote_host_allow_domains(self) -> List[str]:
+        # 默认允许的公开域名后缀；可通过配置追加
+        defaults = [
+            "steamcommunity.com",
+            "steamstatic.com",
+            "steampowered.com",
+            "akamaihd.net",
+            "images.weserv.nl",
+        ]
+        custom = parse_ids(self.config.get("remote_host_allowlist", ""))
+        return [x.strip().lower() for x in (defaults + custom) if str(x).strip()]
+
+    def _is_host_in_domains(self, host: str, domains: List[str]) -> bool:
+        host = (host or "").strip().lower()
+        if not host:
+            return False
+        for d in domains:
+            if host == d or host.endswith("." + d):
+                return True
+        return False
+
     def _with_image_proxy(self, url: str, proxy_prefix: str) -> str:
         prefix = (proxy_prefix or "").strip()
         if not prefix:
@@ -425,11 +446,22 @@ class SteamFriendMonitor(Star):
                     f"[steam-monitor] blocked remote url by private/local host: url={url} host={host}"
                 )
                 return False
-            if await self._is_host_resolved_private(host):
-                logger.warning(
-                    f"[steam-monitor] blocked remote url by dns-resolved private ip: url={url} host={host}"
+
+            allow_domains = self._remote_host_allow_domains()
+            bypass_dns_private = bool(
+                self.config.get("allow_dns_private_for_allow_domains", True)
+            )
+            if bypass_dns_private and self._is_host_in_domains(host, allow_domains):
+                logger.debug(
+                    "[steam-monitor] skip dns-private check for allow-domain: "
+                    f"url={url} host={host}"
                 )
-                return False
+            else:
+                if await self._is_host_resolved_private(host):
+                    logger.warning(
+                        f"[steam-monitor] blocked remote url by dns-resolved private ip: url={url} host={host}"
+                    )
+                    return False
 
             strict = bool(self.config.get("strict_remote_host", False))
             if not strict:
@@ -438,17 +470,9 @@ class SteamFriendMonitor(Star):
                 )
                 return True
 
-            custom = parse_ids(self.config.get("remote_host_allowlist", ""))
-            allow = [
-                "steamcommunity.com",
-                "steamstatic.com",
-                "steampowered.com",
-                "akamaihd.net",
-                "images.weserv.nl",
-            ] + custom
-            ok = any(host == d or host.endswith("." + d) for d in allow)
+            ok = self._is_host_in_domains(host, allow_domains)
             logger.debug(
-                f"[steam-monitor] strict allowlist check host={host} allowed={ok} allow={allow}"
+                f"[steam-monitor] strict allowlist check host={host} allowed={ok} allow={allow_domains}"
             )
             return ok
         except Exception as e:
@@ -1015,7 +1039,7 @@ class SteamFriendMonitor(Star):
             targets.append(umo)
             await self._update_targets_atomic(targets)
         yield event.plain_result(
-            "已绑定当前会话为 Steam 监控推送目标（可在配置页 push_targets 查看）"
+            "已绑定当前会话"
         )
 
     @filter.command("sfm_unbind")

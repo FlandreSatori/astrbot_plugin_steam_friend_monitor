@@ -31,5 +31,11 @@
     "type": "string",
     "default": "https://images.weserv.nl/?url=",
     "hint": "留空为直连；可用 {url} 或 %s 占位，例如 https://images.weserv.nl/?url= 或 https://your-proxy/fetch?url={url}"
+  },
+  "allow_dns_private_for_allow_domains": {
+    "description": "允许对白名单域名跳过 DNS 私网解析拦截",
+    "type": "bool",
+    "default": true,
+    "hint": "用于修复部分网络环境下 Steam 官方域名被 DNS 污染/劫持为私网地址导致的误拦截；关闭后将恢复严格拦截"
   }
 }
