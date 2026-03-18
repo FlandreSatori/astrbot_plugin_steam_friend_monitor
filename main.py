@@ -276,6 +276,32 @@ class SteamFriendMonitor(Star):
 
         return players
 
+    def _order_players_by_ids(
+        self, players: List[Dict[str, Any]], steam_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        if not players:
+            return []
+
+        desired = _dedup_keep_order(steam_ids)
+        player_map = {str(p.get("steamid", "")): p for p in players}
+
+        ordered = [player_map[sid] for sid in desired if sid in player_map]
+
+        desired_set = set(desired)
+        rest = [
+            p
+            for p in players
+            if str(p.get("steamid", "")) not in desired_set
+        ]
+        rest.sort(
+            key=lambda p: (
+                str(p.get("personaname", "")).lower(),
+                str(p.get("steamid", "")),
+            )
+        )
+
+        return ordered + rest
+
     def _is_private_host(self, host: str) -> bool:
         host = (host or "").strip().lower()
         if not host:
@@ -628,7 +654,11 @@ class SteamFriendMonitor(Star):
 
     async def _push_image(self, umo: str, text: str, image_path: str):
         chain = MessageChain()
-        chain.chain = [Comp.Plain(text=text), Comp.Image.fromFileSystem(image_path)]
+        items = []
+        if (text or "").strip():
+            items.append(Comp.Plain(text=text))
+        items.append(Comp.Image.fromFileSystem(image_path))
+        chain.chain = items
         await self.context.send_message(umo, chain)
 
     def _compute_next_interval(self, steam_ids: List[str], default_sec: int) -> int:
@@ -749,7 +779,8 @@ class SteamFriendMonitor(Star):
                 self._save_state()
 
                 if events:
-                    image_path = await self._render_status_image(players)
+                    ordered_players = self._order_players_by_ids(players, steam_ids)
+                    image_path = await self._render_status_image(ordered_players)
                     targets = self._get_targets()
                     if targets:
                         text = "Steam 状态变化：" + chr(10) + chr(10).join(events)
@@ -880,7 +911,6 @@ class SteamFriendMonitor(Star):
 
     @filter.command("sfm_status")
     async def status(self, event: AstrMessageEvent):
-
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
@@ -892,27 +922,18 @@ class SteamFriendMonitor(Star):
         image_path = None
         try:
             players = await self._fetch_players(steam_ids)
-            image_path = await self._render_status_image(players)
-            msg = chr(10).join(
-                [
-                    f"{p.get('personaname', '?')}: {persona_text(int(p.get('personastate', 0)))}"
-                    for p in players
-                ]
-            )
-
-            chain = MessageChain()
-            chain.chain = [
-                Comp.Plain(text="当前状态：" + chr(10) + msg),
-                Comp.Image.fromFileSystem(image_path),
-            ]
-            yield event.chain_result(chain)
+            ordered_players = self._order_players_by_ids(players, steam_ids)
+            image_path = await self._render_status_image(ordered_players)
+            await self._push_image(event.unified_msg_origin, "", image_path)
+        except Exception as e:
+            logger.error(f"[steam-monitor] status failed: {e}", exc_info=True)
+            yield event.plain_result(f"获取状态失败: {e}")
         finally:
             if image_path:
                 self._schedule_delayed_unlink(image_path, 30)
 
     @filter.command("sfm_test")
     async def steam_monitor_test(self, event: AstrMessageEvent, action: str = "all"):
-
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
@@ -939,6 +960,7 @@ class SteamFriendMonitor(Star):
         image_path = None
         try:
             players = await self._fetch_players(steam_ids)
+            ordered_players = self._order_players_by_ids(players, steam_ids)
             status_text = chr(10).join(
                 [
                     f"{p.get('personaname', '?')}: {persona_text(int(p.get('personastate', 0)))}"
@@ -947,7 +969,7 @@ class SteamFriendMonitor(Star):
                         if p.get("gameextrainfo")
                         else ""
                     )
-                    for p in players
+                    for p in ordered_players
                 ]
             )
 
@@ -957,30 +979,31 @@ class SteamFriendMonitor(Star):
                 )
                 return
 
-            image_path = await self._render_status_image(players)
-
-            chain = MessageChain()
-            chain.chain = [
-                Comp.Plain(text="[steam_monitor_test] 状态拉取成功，测试图如下"),
-                Comp.Image.fromFileSystem(image_path),
-            ]
-            yield event.chain_result(chain)
+            image_path = await self._render_status_image(ordered_players)
+            await self._push_image(
+                event.unified_msg_origin,
+                "[steam_monitor_test] 状态拉取成功，测试图如下",
+                image_path,
+            )
 
             if action in ("push", "all"):
-                ok = 0
-                for umo in targets:
-                    try:
-                        await self._push_image(
-                            umo, "[steam_monitor_test] 目标会话测试推送", image_path
-                        )
-                        ok += 1
-                    except Exception as e:
-                        logger.error(f"[steam-monitor] test push failed {umo}: {e}")
-                if targets:
+                if not targets:
+                    yield event.plain_result("[steam_monitor_test] 未配置推送目标")
+                else:
+                    ok = 0
+                    for umo in targets:
+                        try:
+                            await self._push_image(
+                                umo, "[steam_monitor_test] 目标会话测试推送", image_path
+                            )
+                            ok += 1
+                        except Exception as e:
+                            logger.error(f"[steam-monitor] test push failed {umo}: {e}", exc_info=True)
                     yield event.plain_result(
                         f"[steam_monitor_test] 目标会话测试推送完成: {ok}/{len(targets)}"
                     )
         except Exception as e:
+            logger.error(f"[steam-monitor] test failed: {e}", exc_info=True)
             yield event.plain_result(f"[steam_monitor_test] 执行失败: {e}")
         finally:
             if image_path:
