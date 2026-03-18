@@ -144,6 +144,7 @@ class SteamFriendMonitor(Star):
             "[steam-monitor] image cfg: "
             f"image_proxy_prefix={self.config.get('image_proxy_prefix', 'https://images.weserv.nl/?url=')} "
             f"strict_remote_host={self.config.get('strict_remote_host', False)} "
+            f"allow_dns_private_for_allow_domains={self.config.get('allow_dns_private_for_allow_domains', True)} "
             f"remote_host_allowlist={self.config.get('remote_host_allowlist', '')} "
             f"max_redirects={self.config.get('max_redirects', 3)} "
             f"max_image_bytes={self.config.get('max_image_bytes', 3 * 1024 * 1024)}"
@@ -666,12 +667,14 @@ class SteamFriendMonitor(Star):
             "[steam-monitor] fetch options: "
             f"url={url} allowed_types={allowed_types} max_bytes={max_bytes} max_redirects={max_redirects}"
         )
+        fail_reasons: List[str] = []
 
         for origin in candidates:
             current = origin
             logger.debug(f"[steam-monitor] start fetch origin={origin}")
             if not await self._is_allowed_remote_url(current):
                 logger.debug(f"[steam-monitor] blocked remote url: {current}")
+                fail_reasons.append(f"blocked:{current}")
                 continue
 
             try:
@@ -695,6 +698,9 @@ class SteamFriendMonitor(Star):
                                 logger.warning(
                                     f"[steam-monitor] redirect without location: from={current} status={resp.status_code}"
                                 )
+                                fail_reasons.append(
+                                    f"redirect-no-location:{current}:status={resp.status_code}"
+                                )
                                 break
                             next_url = str(httpx.URL(location, base=resp.request.url))
                             logger.debug(
@@ -704,6 +710,7 @@ class SteamFriendMonitor(Star):
                                 logger.warning(
                                     f"[steam-monitor] blocked redirect target: {next_url}"
                                 )
+                                fail_reasons.append(f"blocked-redirect:{next_url}")
                                 break
                             current = next_url
                             continue
@@ -711,6 +718,9 @@ class SteamFriendMonitor(Star):
                         if resp.status_code != 200:
                             logger.warning(
                                 f"[steam-monitor] fetch non-200: url={current} status={resp.status_code}"
+                            )
+                            fail_reasons.append(
+                                f"non-200:{current}:status={resp.status_code}"
                             )
                             break
 
@@ -721,6 +731,9 @@ class SteamFriendMonitor(Star):
                             logger.warning(
                                 f"[steam-monitor] content-type not allowed: url={current} content-type={ctype} allowed={allowed_types}"
                             )
+                            fail_reasons.append(
+                                f"bad-content-type:{current}:ctype={ctype}"
+                            )
                             break
 
                         clen = resp.headers.get("content-length")
@@ -729,6 +742,9 @@ class SteamFriendMonitor(Star):
                                 if int(clen) > max_bytes:
                                     logger.warning(
                                         f"[steam-monitor] content-length too large: url={current} content-length={clen} max={max_bytes}"
+                                    )
+                                    fail_reasons.append(
+                                        f"too-large-header:{current}:content-length={clen}"
                                     )
                                     break
 
@@ -739,6 +755,9 @@ class SteamFriendMonitor(Star):
                                 logger.warning(
                                     f"[steam-monitor] streamed bytes exceeded limit: url={current} size={len(buf)} max={max_bytes}"
                                 )
+                                fail_reasons.append(
+                                    f"too-large-stream:{current}:size={len(buf)}"
+                                )
                                 buf = bytearray()
                                 break
 
@@ -746,6 +765,7 @@ class SteamFriendMonitor(Star):
                             logger.warning(
                                 f"[steam-monitor] empty body after fetch: url={current}"
                             )
+                            fail_reasons.append(f"empty-body:{current}")
                             break
 
                         raw = bytes(buf)
@@ -762,8 +782,12 @@ class SteamFriendMonitor(Star):
                 logger.debug(
                     f"[steam-monitor] fetch image bytes failed: {origin} err={e}"
                 )
+                fail_reasons.append(f"exception:{origin}:{type(e).__name__}:{e}")
 
-        logger.warning(f"[steam-monitor] all fetch candidates failed: url={url}")
+        reason_text = " | ".join(fail_reasons[-6:]) if fail_reasons else "unknown"
+        logger.warning(
+            f"[steam-monitor] all fetch candidates failed: url={url} reasons={reason_text}"
+        )
         return None
 
     async def _get_game_icon_url(self, appid: str) -> str | None:
@@ -838,7 +862,6 @@ class SteamFriendMonitor(Star):
             max_bytes=1024 * 1024,
         )
         if not raw:
-            self._cache_set(self.profile_game_cache, steamid, "", "profile_game")
             return ""
 
         try:
@@ -866,10 +889,10 @@ class SteamFriendMonitor(Star):
             # 按当前策略：提取到的状态文本直接作为游戏名。
             game_name = state_message
 
-            self._cache_set(
-                self.profile_game_cache, steamid, game_name, "profile_game"
-            )
             if game_name:
+                self._cache_set(
+                    self.profile_game_cache, steamid, game_name, "profile_game"
+                )
                 logger.debug(
                     f"[steam-monitor] profile fallback game name resolved steamid={steamid} game={game_name}"
                 )
@@ -878,7 +901,6 @@ class SteamFriendMonitor(Star):
             logger.debug(
                 f"[steam-monitor] profile fallback parse failed steamid={steamid}: {e}"
             )
-            self._cache_set(self.profile_game_cache, steamid, "", "profile_game")
             return ""
 
     def _process_image_bytes(
