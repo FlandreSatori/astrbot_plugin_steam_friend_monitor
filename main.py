@@ -115,8 +115,10 @@ class SteamFriendMonitor(Star):
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_steam_friend_monitor")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.data_dir / "state.json"
+        self.group_configs_file = self.data_dir / "group_configs.json"
 
         self.state: Dict[str, Any] = self._load_state()
+        self.group_configs: Dict[str, List[str]] = self._load_group_configs()
         self._stop = False
         self._task: asyncio.Task | None = None
 
@@ -175,6 +177,43 @@ class SteamFriendMonitor(Star):
             json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         tmp.replace(self.state_file)
+
+    def _load_group_configs(self) -> Dict[str, List[str]]:
+        if not self.group_configs_file.exists():
+            return {}
+        try:
+            data = json.loads(self.group_configs_file.read_text(encoding="utf-8"))
+            return {str(k): v for k, v in data.items()}
+        except Exception as e:
+            logger.warning(f"[steam-monitor] load group configs failed: {e}")
+            return {}
+
+    def _save_group_configs(self):
+        tmp = self.group_configs_file.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(self.group_configs, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tmp.replace(self.group_configs_file)
+
+    def _get_group_steam_ids(self, group_id: str) -> List[str] | None:
+        """获取某个群的专属监控 ID，如果未设置则返回 None"""
+        group_id = str(group_id or "").strip()
+        return self.group_configs.get(group_id)
+
+    def _set_group_steam_ids(self, group_id: str, steam_ids: List[str]):
+        """设置某个群的专属监控 ID"""
+        group_id = str(group_id or "").strip()
+        uniq = _dedup_keep_order(steam_ids)
+        if uniq:
+            self.group_configs[group_id] = uniq
+        else:
+            self.group_configs.pop(group_id, None)
+        self._save_group_configs()
+
+    async def _update_group_steam_ids_atomic(self, group_id: str, steam_ids: List[str]):
+        """原子操作更新群 steam_ids"""
+        async with self._config_lock:
+            self._set_group_steam_ids(group_id, steam_ids)
 
     def _save_config_safe(self):
         try:
@@ -910,99 +949,39 @@ class SteamFriendMonitor(Star):
         while not self._stop:
             image_path = None
             try:
-                steam_ids = parse_ids(self.config.get("steam_ids", ""))
+                # 获取全局 steam_ids 和推送目标
+                global_steam_ids = parse_ids(self.config.get("steam_ids", ""))
                 default_interval = int(self.config.get("poll_interval_sec", 60) or 60)
+                targets = self._get_targets()
 
-                if not steam_ids:
+                if not global_steam_ids and not any(
+                    self._get_group_steam_ids(target) for target in targets
+                ):
                     await asyncio.sleep(max(30, default_interval))
                     continue
 
-                players = await self._fetch_players(steam_ids)
-                player_map = {str(p.get("steamid", "")): p for p in players}
+                # 为每个 target 单独处理一次（需要使用其对应的 steam_ids）
+                for target in targets:
+                    try:
+                        # 获取该 target 对应的 steam_ids，优先使用群级别，否则用全局
+                        group_ids = self._get_group_steam_ids(target)
+                        steam_ids = group_ids if group_ids is not None else global_steam_ids
 
-                events = []
-                now = now_iso()
-                for sid in steam_ids:
-                    p = player_map.get(sid)
-                    if p is None:
-                        prev_record = self.state.get(sid, {})
-                        prev = prev_record.get("personastate")
-                        prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
-                        self.state[sid] = {
-                            "personaname": prev_record.get("personaname", sid),
-                            "personastate": 0,
-                            "gameextrainfo": "",
-                            "offline_since": prev_record.get("offline_since", now),
-                            "ts": now,
-                            "missing": True,
-                        }
-                        if prev is not None and prev != 0:
-                            events.append(
-                                f"{prev_record.get('personaname', sid)}: 下线（接口未返回）"
+                        if not steam_ids:
+                            logger.debug(
+                                f"[steam-monitor] skip poll for target={target} (no steam_ids)"
                             )
-                        elif prev is not None and prev_game:
-                            events.append(
-                                f"{prev_record.get('personaname', sid)}: 关闭游戏《{prev_game}》（接口未返回）"
-                            )
-                        continue
+                            continue
 
-                    st = int(p.get("personastate", 0))
-                    game = (p.get("gameextrainfo", "") or "").strip()
+                        await self._poll_for_target(target, steam_ids, default_interval)
+                    except Exception as e:
+                        logger.error(
+                            f"[steam-monitor] poll for target {target} failed: {e}"
+                        )
 
-                    prev_record = self.state.get(sid, {})
-                    prev = prev_record.get("personastate")
-                    prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
-
-                    offline_since = prev_record.get("offline_since", "")
-                    if st == 0:
-                        if not (prev == 0 and offline_since):
-                            offline_since = now
-                    else:
-                        offline_since = ""
-
-                    self.state[sid] = {
-                        "personaname": p.get("personaname", ""),
-                        "personastate": st,
-                        "gameextrainfo": game,
-                        "offline_since": offline_since,
-                        "ts": now,
-                        "missing": False,
-                    }
-
-                    if prev is None:
-                        continue
-
-                    name = p.get("personaname", "?")
-                    if prev == 0 and st != 0:
-                        events.append(f"{name} 上线 ({persona_text(st)})")
-                    elif prev != 0 and st == 0:
-                        events.append(f"{name} 下线")
-
-                    if st != 0:
-                        if not prev_game and game:
-                            events.append(f"{name} 启动游戏《{game}》")
-                        elif prev_game and not game:
-                            events.append(f"{name} 关闭游戏《{prev_game}》")
-                        elif prev_game and game and prev_game != game:
-                            events.append(
-                                f"{name} 切换游戏《{prev_game}》 -> 《{game}》"
-                            )
-
-                self._save_state()
-
-                if events:
-                    ordered_players = self._order_players_by_ids(players, steam_ids)
-                    image_path = await self._render_status_image(ordered_players)
-                    targets = self._get_targets()
-                    if targets:
-                        text = "" + chr(10) + chr(10).join(events)
-                        for umo in targets:
-                            try:
-                                await self._push_image(umo, text, image_path)
-                            except Exception as e:
-                                logger.error(f"[steam-monitor] push failed {umo}: {e}")
-
-                next_sleep = self._compute_next_interval(steam_ids, default_interval)
+                next_sleep = self._compute_next_interval(
+                    global_steam_ids, default_interval
+                )
                 logger.info(f"[steam-monitor] next poll in {next_sleep}s")
                 await asyncio.sleep(next_sleep)
             except asyncio.CancelledError:
@@ -1022,6 +1001,98 @@ class SteamFriendMonitor(Star):
                 if image_path:
                     with contextlib.suppress(Exception):
                         Path(image_path).unlink(missing_ok=True)
+
+    async def _poll_for_target(
+        self, target: str, steam_ids: List[str], default_interval: int
+    ):
+        """为单个 target 执行一次轮询"""
+        image_path = None
+        try:
+            players = await self._fetch_players(steam_ids)
+            player_map = {str(p.get("steamid", "")): p for p in players}
+
+            events = []
+            now = now_iso()
+            for sid in steam_ids:
+                p = player_map.get(sid)
+                if p is None:
+                    prev_record = self.state.get(sid, {})
+                    prev = prev_record.get("personastate")
+                    prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
+                    self.state[sid] = {
+                        "personaname": prev_record.get("personaname", sid),
+                        "personastate": 0,
+                        "gameextrainfo": "",
+                        "offline_since": prev_record.get("offline_since", now),
+                        "ts": now,
+                        "missing": True,
+                    }
+                    if prev is not None and prev != 0:
+                        events.append(
+                            f"{prev_record.get('personaname', sid)}: 下线（接口未返回）"
+                        )
+                    elif prev is not None and prev_game:
+                        events.append(
+                            f"{prev_record.get('personaname', sid)}: 关闭游戏《{prev_game}》（接口未返回）"
+                        )
+                    continue
+
+                st = int(p.get("personastate", 0))
+                game = (p.get("gameextrainfo", "") or "").strip()
+
+                prev_record = self.state.get(sid, {})
+                prev = prev_record.get("personastate")
+                prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
+
+                offline_since = prev_record.get("offline_since", "")
+                if st == 0:
+                    if not (prev == 0 and offline_since):
+                        offline_since = now
+                else:
+                    offline_since = ""
+
+                self.state[sid] = {
+                    "personaname": p.get("personaname", ""),
+                    "personastate": st,
+                    "gameextrainfo": game,
+                    "offline_since": offline_since,
+                    "ts": now,
+                    "missing": False,
+                }
+
+                if prev is None:
+                    continue
+
+                name = p.get("personaname", "?")
+                if prev == 0 and st != 0:
+                    events.append(f"{name} 上线 ({persona_text(st)})")
+                elif prev != 0 and st == 0:
+                    events.append(f"{name} 下线")
+
+                if st != 0:
+                    if not prev_game and game:
+                        events.append(f"{name} 启动游戏《{game}》")
+                    elif prev_game and not game:
+                        events.append(f"{name} 关闭游戏《{prev_game}》")
+                    elif prev_game and game and prev_game != game:
+                        events.append(
+                            f"{name} 切换游戏《{prev_game}》 -> 《{game}》"
+                        )
+
+            self._save_state()
+
+            if events:
+                ordered_players = self._order_players_by_ids(players, steam_ids)
+                image_path = await self._render_status_image(ordered_players)
+                text = "" + chr(10) + chr(10).join(events)
+                try:
+                    await self._push_image(target, text, image_path)
+                except Exception as e:
+                    logger.error(f"[steam-monitor] push failed {target}: {e}")
+        finally:
+            if image_path:
+                with contextlib.suppress(Exception):
+                    Path(image_path).unlink(missing_ok=True)
 
     def _validate_steam_id64(self, sid: str) -> bool:
         sid = (sid or "").strip()
@@ -1220,3 +1291,113 @@ class SteamFriendMonitor(Star):
         finally:
             if image_path:
                 self._schedule_delayed_unlink(image_path, 30)
+
+    @filter.command("sfm_set_group_ids")
+    async def set_group_ids(self, event: AstrMessageEvent, ids: str):
+        """为当前群设置独立的监控 ID"""
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+        
+        group_id = event.unified_msg_origin
+        parsed = parse_ids(ids)
+        valid = [sid for sid in parsed if self._validate_steam_id64(sid)]
+        invalid = [sid for sid in parsed if not self._validate_steam_id64(sid)]
+        
+        await self._update_group_steam_ids_atomic(group_id, valid)
+        
+        if not valid:
+            yield event.plain_result("未设置任何有效的 SteamID")
+            return
+        
+        if invalid:
+            yield event.plain_result(
+                f"[当前群] 已设置监控ID数量: {len(valid)}；忽略非法ID {len(invalid)} 个："
+                + ", ".join(invalid[:10])
+            )
+        else:
+            yield event.plain_result(f"[当前群] 已设置监控ID数量: {len(valid)}")
+
+    @filter.command("sfm_add_group_id")
+    async def add_group_id(self, event: AstrMessageEvent, steam_id64: str):
+        """为当前群添加一个监控 ID"""
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+        
+        steam_id64 = (steam_id64 or "").strip()
+        if not self._validate_steam_id64(steam_id64):
+            yield event.plain_result("SteamID64 格式不正确")
+            return
+        
+        group_id = event.unified_msg_origin
+        ids = self._get_group_steam_ids(group_id) or []
+        
+        if steam_id64 not in ids:
+            ids.append(steam_id64)
+        
+        await self._update_group_steam_ids_atomic(group_id, ids)
+        yield event.plain_result(
+            f"[当前群] 已添加 SteamID64: {steam_id64}，当前监控数量: {len(ids)}"
+        )
+
+    @filter.command("sfm_del_group_id")
+    async def del_group_id(self, event: AstrMessageEvent, steam_id64: str):
+        """为当前群删除一个监控 ID"""
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+        
+        steam_id64 = (steam_id64 or "").strip()
+        group_id = event.unified_msg_origin
+        ids = self._get_group_steam_ids(group_id)
+        
+        if ids and steam_id64 in ids:
+            ids.remove(steam_id64)
+            await self._update_group_steam_ids_atomic(group_id, ids)
+            yield event.plain_result(
+                f"[当前群] 已移除 SteamID64: {steam_id64}，当前监控数量: {len(ids)}"
+            )
+        else:
+            yield event.plain_result(
+                "[当前群] 该 SteamID64 不在监控列表中，或未为本群单独设置监控"
+            )
+
+    @filter.command("sfm_group_ids")
+    async def show_group_ids(self, event: AstrMessageEvent):
+        """查看当前群的监控 ID 设置"""
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+        
+        group_id = event.unified_msg_origin
+        group_ids = self._get_group_steam_ids(group_id)
+        
+        if group_ids is None:
+            global_ids = parse_ids(self.config.get("steam_ids", ""))
+            if global_ids:
+                yield event.plain_result(
+                    f"[当前群] 未设置独立监控，使用全局设置({len(global_ids)}个)：\n"
+                    + ",\n".join(global_ids)
+                )
+            else:
+                yield event.plain_result("[当前群] 未设置独立监控，全局也无监控设置")
+        else:
+            yield event.plain_result(
+                f"[当前群] 独立监控设置({len(group_ids)}个)：\n"
+                + ",\n".join(group_ids)
+            )
+
+    @filter.command("sfm_clear_group_ids")
+    async def clear_group_ids(self, event: AstrMessageEvent):
+        """清除当前群的独立设置，回到全局设置"""
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+        
+        group_id = event.unified_msg_origin
+        if group_id in self.group_configs:
+            await self._update_group_steam_ids_atomic(group_id, [])
+            yield event.plain_result("[当前群] 已清除独立设置，将使用全局监控配置")
+        else:
+            yield event.plain_result("[当前群] 未设置独立监控，无需清除")
