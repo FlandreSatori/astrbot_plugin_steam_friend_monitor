@@ -21,6 +21,12 @@
     "type": "int",
     "default": 60
   },
+  "steam_api_retries": {
+    "description": "Steam API 重试次数（每批次）",
+    "type": "int",
+    "default": 2,
+    "hint": "网络不稳定（如树莓派弱网）可适当提高到 3-5"
+  },
   "online_only": {
     "description": "仅在离线->在线时推送（true）",
     "type": "bool",

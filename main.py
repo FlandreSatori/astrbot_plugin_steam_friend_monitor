@@ -21,6 +21,12 @@ from astrbot.api.star import Context, Star, StarTools
 
 STEAM_SUMMARY_API = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
 
+try:
+    LANCZOS_RESAMPLE = Image.Resampling.LANCZOS
+except AttributeError:
+    # Pillow < 9.1 fallback (common on some ARM images)
+    LANCZOS_RESAMPLE = Image.LANCZOS
+
 
 def parse_ids(raw: str) -> List[str]:
     text = (raw or "").replace(chr(10), ",")
@@ -42,6 +48,10 @@ def persona_text(state: int) -> str:
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def format_exc(e: Exception) -> str:
+    return f"{type(e).__name__}: {e!r}"
 
 
 def parse_iso(ts: str) -> datetime | None:
@@ -266,13 +276,25 @@ class SteamFriendMonitor(Star):
             100, max(1, int(self.config.get("steam_batch_size", 100) or 100))
         )
         players: List[Dict[str, Any]] = []
+        retries = max(0, int(self.config.get("steam_api_retries", 2) or 2))
         for i in range(0, len(uniq_ids), batch_size):
             chunk = uniq_ids[i : i + batch_size]
             params = {"key": api_key, "steamids": ",".join(chunk)}
-            r = await self.http.get(STEAM_SUMMARY_API, params=params)
-            r.raise_for_status()
-            data = r.json()
-            players.extend(data.get("response", {}).get("players", []))
+            last_err = None
+            for attempt in range(retries + 1):
+                try:
+                    r = await self.http.get(STEAM_SUMMARY_API, params=params)
+                    r.raise_for_status()
+                    data = r.json()
+                    players.extend(data.get("response", {}).get("players", []))
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < retries:
+                        await asyncio.sleep(min(3, 1 + attempt))
+            if last_err is not None:
+                raise last_err
 
         return players
 
@@ -518,7 +540,7 @@ class SteamFriendMonitor(Star):
                     )
                     return None
                 img = opened.convert("RGBA")
-            img = img.resize(size, Image.Resampling.LANCZOS)
+            img = img.resize(size, LANCZOS_RESAMPLE)
             if circle:
                 img = circle_crop(img)
             return img
@@ -581,9 +603,21 @@ class SteamFriendMonitor(Star):
             return sid, {"avatar": avatar, "game_icon": game_icon}
 
         pairs = await asyncio.gather(
-            *(one_player(p) for p in players), return_exceptions=False
+            *(one_player(p) for p in players), return_exceptions=True
         )
-        return dict(pairs)
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for p, item in zip(players, pairs):
+            sid = str(p.get("steamid", ""))
+            if isinstance(item, Exception):
+                logger.warning(
+                    f"[steam-monitor] prepare asset failed sid={sid}: {format_exc(item)}"
+                )
+                result[sid] = {"avatar": None, "game_icon": None}
+            else:
+                k, v = item
+                result[k] = v
+        return result
 
     def _build_status_image(
         self, players: List[Dict[str, Any]], assets: Dict[str, Dict[str, Any]]
@@ -796,7 +830,9 @@ class SteamFriendMonitor(Star):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[steam-monitor] poll error: {e}")
+                logger.error(
+                    f"[steam-monitor] poll error: {format_exc(e)}", exc_info=True
+                )
                 if "steam_api_key" in str(e):
                     await asyncio.sleep(
                         max(
