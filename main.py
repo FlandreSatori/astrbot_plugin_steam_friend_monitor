@@ -322,6 +322,7 @@ class SteamFriendMonitor(Star):
         self._save_config_safe()
 
     async def _fetch_players(self, steam_ids: List[str]) -> List[Dict[str, Any]]:
+        """获取玩家数据，带重试机制"""
         api_key = self.config.get("steam_api_key", "")
         if not api_key:
             raise RuntimeError("未配置 steam_api_key")
@@ -334,14 +335,36 @@ class SteamFriendMonitor(Star):
         batch_size = min(
             100, max(1, int(self.config.get("steam_batch_size", 100) or 100))
         )
+        
+        max_retries = 3
+        retry_delay = 1.0
+        
         players: List[Dict[str, Any]] = []
         for i in range(0, len(uniq_ids), batch_size):
             chunk = uniq_ids[i : i + batch_size]
             params = {"key": api_key, "steamids": ",".join(chunk)}
-            r = await self.http.get(STEAM_SUMMARY_API, params=params)
-            r.raise_for_status()
-            data = r.json()
-            players.extend(data.get("response", {}).get("players", []))
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    r = await self.http.get(STEAM_SUMMARY_API, params=params)
+                    r.raise_for_status()
+                    data = r.json()
+                    players.extend(data.get("response", {}).get("players", []))
+                    break  # 成功，跳出重试循环
+                except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+                    if attempt < max_retries:
+                        logger.warning(
+                            f"[steam-monitor] fetch players network error (attempt {attempt + 1}/{max_retries + 1}): {e}"
+                        )
+                        await asyncio.sleep(retry_delay * (2 ** attempt))  # 指数退避
+                        continue
+                    else:
+                        logger.error(
+                            f"[steam-monitor] fetch players failed after {max_retries + 1} attempts: {e}"
+                        )
+                        raise RuntimeError(
+                            f"无法连接 Steam API（已重试 {max_retries} 次）：{type(e).__name__}"
+                        ) from e
 
         return players
 
@@ -665,18 +688,18 @@ class SteamFriendMonitor(Star):
 
         api = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=schinese"
         logger.debug(f"[steam-monitor] fetch game icon metadata appid={appid} api={api}")
-        raw = await self._fetch_url_bytes(
-            api,
-            allowed_types=("application/json", "text/json", "text/plain"),
-            max_bytes=512 * 1024,
-        )
-        if not raw:
-            logger.warning(
-                f"[steam-monitor] game icon metadata fetch empty appid={appid}"
-            )
-            return None
-
         try:
+            raw = await self._fetch_url_bytes(
+                api,
+                allowed_types=("application/json", "text/json", "text/plain"),
+                max_bytes=512 * 1024,
+            )
+            if not raw:
+                logger.warning(
+                    f"[steam-monitor] game icon metadata fetch empty appid={appid}"
+                )
+                return None
+
             data = json.loads(raw.decode("utf-8", errors="ignore"))
             node = data.get(str(appid), {})
             if not node.get("success"):
@@ -696,6 +719,12 @@ class SteamFriendMonitor(Star):
                     f"[steam-monitor] game icon url missing in metadata appid={appid}"
                 )
             return icon_url
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+            logger.warning(
+                f"[steam-monitor] game icon metadata fetch network error appid={appid}: {type(e).__name__}"
+            )
+            # 网络错误时返回 None，下次会重新尝试，但本次不中断处理
+            return None
         except Exception as e:
             logger.warning(f"[steam-monitor] parse game icon failed appid={appid}: {e}")
             return None
@@ -733,6 +762,28 @@ class SteamFriendMonitor(Star):
             logger.warning(f"[steam-monitor] decode image failed: {e}")
             return None
 
+    async def _fallback_load_cached_image(
+        self, url: str, size: tuple[int, int], circle: bool = False
+    ) -> Image.Image | None:
+        """当网络失败时，尝试从缓存中恢复相同尺寸的图片"""
+        logger.debug(
+            f"[steam-monitor] fallback to cached image url={url} size={size} circle={circle}"
+        )
+        cached_raw = self._cache_get(self.bytes_cache, url)
+        if cached_raw is None:
+            logger.debug(f"[steam-monitor] no cached bytes for url={url}")
+            return None
+        
+        logger.info(
+            f"[steam-monitor] using cached image for url={url} (network error fallback)"
+        )
+        img = await asyncio.to_thread(self._process_image_bytes, cached_raw, size, circle)
+        if img is None:
+            logger.warning(f"[steam-monitor] fallback decode failed url={url}")
+        else:
+            logger.debug(f"[steam-monitor] fallback image success url={url}")
+        return img
+
     async def _load_remote_image(
         self,
         url: str,
@@ -743,29 +794,37 @@ class SteamFriendMonitor(Star):
         logger.debug(
             f"[steam-monitor] load remote image start url={url} size={size} circle={circle} proxy_prefix={proxy_prefix}"
         )
-        raw = await self._fetch_url_bytes(
-            url,
-            proxy_prefix=proxy_prefix,
-            allowed_types=("image/",),
-            max_bytes=max(
-                256 * 1024,
-                int(
-                    self.config.get("max_image_bytes", 3 * 1024 * 1024)
-                    or 3 * 1024 * 1024
+        try:
+            raw = await self._fetch_url_bytes(
+                url,
+                proxy_prefix=proxy_prefix,
+                allowed_types=("image/",),
+                max_bytes=max(
+                    256 * 1024,
+                    int(
+                        self.config.get("max_image_bytes", 3 * 1024 * 1024)
+                        or 3 * 1024 * 1024
+                    ),
                 ),
-            ),
-        )
-        if not raw:
-            logger.warning(
-                f"[steam-monitor] load remote image failed to fetch bytes url={url}"
             )
-            return None
-        img = await asyncio.to_thread(self._process_image_bytes, raw, size, circle)
-        if img is None:
-            logger.warning(f"[steam-monitor] load remote image decode failed url={url}")
-        else:
-            logger.debug(f"[steam-monitor] load remote image success url={url}")
-        return img
+            if not raw:
+                logger.warning(
+                    f"[steam-monitor] load remote image failed to fetch bytes url={url}"
+                )
+                # 尝试从缓存中恢复
+                return await self._fallback_load_cached_image(url, size, circle)
+            img = await asyncio.to_thread(self._process_image_bytes, raw, size, circle)
+            if img is None:
+                logger.warning(f"[steam-monitor] load remote image decode failed url={url}")
+            else:
+                logger.debug(f"[steam-monitor] load remote image success url={url}")
+            return img
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+            logger.warning(
+                f"[steam-monitor] load remote image network error url={url}: {type(e).__name__}"
+            )
+            # 网络错误时尝试从缓存中恢复
+            return await self._fallback_load_cached_image(url, size, circle)
 
     async def _prepare_assets(
         self, players: List[Dict[str, Any]]
@@ -986,7 +1045,7 @@ class SteamFriendMonitor(Star):
                 await asyncio.sleep(next_sleep)
             except asyncio.CancelledError:
                 break
-            except Exception as e:
+            except RuntimeError as e:
                 logger.error(f"[steam-monitor] poll error: {e}")
                 if "steam_api_key" in str(e):
                     await asyncio.sleep(
@@ -997,6 +1056,14 @@ class SteamFriendMonitor(Star):
                     )
                 else:
                     await asyncio.sleep(30)
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+                logger.warning(
+                    f"[steam-monitor] poll network error (will retry): {type(e).__name__}: {e}"
+                )
+                await asyncio.sleep(60)  # 网络错误等更久再重试
+            except Exception as e:
+                logger.error(f"[steam-monitor] poll error: {e}")
+                await asyncio.sleep(30)
             finally:
                 if image_path:
                     with contextlib.suppress(Exception):
@@ -1208,6 +1275,20 @@ class SteamFriendMonitor(Star):
             ordered_players = self._order_players_by_ids(players, steam_ids)
             image_path = await self._render_status_image(ordered_players)
             await self._push_image(event.unified_msg_origin, "", image_path)
+        except RuntimeError as e:
+            logger.error(f"[steam-monitor] status failed: {e}")
+            yield event.plain_result(f"获取状态失败: {str(e)}")
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+            logger.error(f"[steam-monitor] status network error: {e}")
+            error_msg = (
+                "网络连接失败，请稍后重试\n"
+                f"错误类型: {type(e).__name__}\n"
+                "可能的原因:\n"
+                "• Steam API 服务暂时不可用\n"
+                "• 本地网络连接中断\n"
+                "• DNS 解析失败"
+            )
+            yield event.plain_result(error_msg)
         except Exception as e:
             logger.error(f"[steam-monitor] status failed: {e}", exc_info=True)
             yield event.plain_result(f"获取状态失败: {e}")
@@ -1285,6 +1366,17 @@ class SteamFriendMonitor(Star):
                     yield event.plain_result(
                         f"[steam_monitor_test] 目标会话测试推送完成: {ok}/{len(targets)}"
                     )
+        except RuntimeError as e:
+            logger.error(f"[steam-monitor] test failed: {e}")
+            yield event.plain_result(f"[steam_monitor_test] 执行失败: {str(e)}")
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+            logger.error(f"[steam-monitor] test network error: {e}")
+            error_msg = (
+                "[steam_monitor_test] 网络连接失败\n"
+                f"错误类型: {type(e).__name__}\n"
+                "请检查网络连接或稍后重试"
+            )
+            yield event.plain_result(error_msg)
         except Exception as e:
             logger.error(f"[steam-monitor] test failed: {e}", exc_info=True)
             yield event.plain_result(f"[steam_monitor_test] 执行失败: {e}")
