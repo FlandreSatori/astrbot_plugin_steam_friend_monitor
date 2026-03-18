@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
+import hashlib
 import html
+from html.parser import HTMLParser
 import ipaddress
 import json
 import platform
@@ -118,6 +120,8 @@ class SteamFriendMonitor(Star):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.data_dir / "state.json"
         self.group_configs_file = self.data_dir / "group_configs.json"
+        self.image_cache_dir = self.data_dir / "image_cache"
+        self.image_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.state: Dict[str, Any] = self._load_state()
         self.group_configs: Dict[str, List[str]] = self._load_group_configs()
@@ -200,12 +204,12 @@ class SteamFriendMonitor(Star):
         tmp.replace(self.group_configs_file)
 
     def _get_group_steam_ids(self, group_id: str) -> List[str] | None:
-        """获取某个群的专属监控 ID，如果未设置则返回 None"""
+        """获取某个群的专属时间 ID，如果未设置则返回 None"""
         group_id = str(group_id or "").strip()
         return self.group_configs.get(group_id)
 
     def _set_group_steam_ids(self, group_id: str, steam_ids: List[str]):
-        """设置某个群的专属监控 ID"""
+        """设置某个群的专属时间 ID"""
         group_id = str(group_id or "").strip()
         uniq = _dedup_keep_order(steam_ids)
         if uniq:
@@ -390,6 +394,42 @@ class SteamFriendMonitor(Star):
         cache.move_to_end(key)
         while len(cache) > self._cache_limit(kind):
             cache.popitem(last=False)
+
+    def _disk_image_cache_path(self, url: str) -> Path:
+        key = hashlib.sha256((url or "").encode("utf-8", errors="ignore")).hexdigest()
+        sub = self.image_cache_dir / key[:2]
+        sub.mkdir(parents=True, exist_ok=True)
+        return sub / f"{key}.bin"
+
+    def _disk_image_cache_get(self, url: str, max_bytes: int) -> bytes | None:
+        p = self._disk_image_cache_path(url)
+        if not p.exists():
+            return None
+        try:
+            st = p.stat()
+            if time.time() - st.st_mtime > self._cache_ttl():
+                p.unlink(missing_ok=True)
+                return None
+            if st.st_size <= 0 or st.st_size > max_bytes:
+                p.unlink(missing_ok=True)
+                return None
+            return p.read_bytes()
+        except Exception as e:
+            logger.debug(f"[steam-monitor] read disk image cache failed url={url}: {e}")
+            return None
+
+    def _disk_image_cache_set(self, url: str, raw: bytes):
+        if not raw:
+            return
+        p = self._disk_image_cache_path(url)
+        tmp = p.with_suffix(".tmp")
+        try:
+            tmp.write_bytes(raw)
+            tmp.replace(p)
+        except Exception as e:
+            logger.debug(f"[steam-monitor] write disk image cache failed url={url}: {e}")
+            with contextlib.suppress(Exception):
+                tmp.unlink(missing_ok=True)
 
     def _is_authorized(self, event: AstrMessageEvent) -> bool:
         allow = parse_ids(self.config.get("admin_origins", ""))
@@ -639,6 +679,7 @@ class SteamFriendMonitor(Star):
         proxy_prefix: str = "",
         allowed_types: tuple[str, ...] = ("image/", "application/json"),
         max_bytes: int = 3 * 1024 * 1024,
+        headers: Dict[str, str] | None = None,
     ) -> bytes | None:
         if not url:
             logger.debug("[steam-monitor] _fetch_url_bytes skipped: empty url")
@@ -651,6 +692,16 @@ class SteamFriendMonitor(Star):
             )
             return cached
         logger.debug(f"[steam-monitor] bytes cache miss: url={url}")
+
+        image_fetch = any((x or "").startswith("image/") for x in allowed_types)
+        if image_fetch:
+            disk_cached = self._disk_image_cache_get(url, max_bytes=max_bytes)
+            if disk_cached is not None:
+                self._cache_set(self.bytes_cache, url, disk_cached, "bytes")
+                logger.info(
+                    f"[steam-monitor] disk image cache hit: url={url} size={len(disk_cached)}"
+                )
+                return disk_cached
 
         if not self.http:
             self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
@@ -683,7 +734,7 @@ class SteamFriendMonitor(Star):
                         f"[steam-monitor] request hop={hop}/{max_redirects} current={current}"
                     )
                     async with self.http.stream(
-                        "GET", current, follow_redirects=False
+                        "GET", current, follow_redirects=False, headers=headers
                     ) as resp:
                         logger.debug(
                             "[steam-monitor] response received: "
@@ -770,6 +821,8 @@ class SteamFriendMonitor(Star):
 
                         raw = bytes(buf)
                         self._cache_set(self.bytes_cache, url, raw, "bytes")
+                        if image_fetch:
+                            self._disk_image_cache_set(url, raw)
                         logger.debug(
                             f"[steam-monitor] fetch success: url={current} origin_key={url} size={len(raw)}"
                         )
@@ -845,8 +898,49 @@ class SteamFriendMonitor(Star):
     def _profile_game_fallback_enabled(self) -> bool:
         return bool(self.config.get("enable_profile_game_fallback", True))
 
+    def _normalize_game_name(self, game_name: str) -> str:
+        """标准化游戏名称，处理特殊状态文案"""
+        game_name = (game_name or "").strip()
+        if not game_name:
+            return ""
+
+        # 精确匹配规则
+        exact_mappings = {
+            "当前正在游戏": "",
+            "当前在线": "",
+            "VR 在线": "VR",
+            "非 Steam 游戏中": "非 Steam 游戏",
+        }
+
+        if game_name in exact_mappings:
+            return exact_mappings[game_name]
+
+        return game_name
+
+    def _extract_profile_in_game_header_from_html(self, page: str) -> str:
+        """从 HTML 中直接提取 profile_in_game_header 的游戏名。"""
+        if not page:
+            return ""
+
+        # 简单正则提取 profile_in_game_header class 中的内容
+        pattern = re.compile(
+            r'<(?P<tag>[a-z0-9]+)[^>]*class\s*=\s*["\']?[^"\']*profile_in_game_header[^"\']*["\']?[^>]*>(?P<body>.*?)</\1>',
+            re.I | re.S,
+        )
+
+        with contextlib.suppress(Exception):
+            match = pattern.search(page)
+            if match:
+                raw_text = html.unescape(match.group("body"))
+                raw_text = re.sub(r"<[^>]+>", " ", raw_text)
+                game_name = re.sub(r"\s+", " ", raw_text).strip()
+                if game_name:
+                    return self._normalize_game_name(game_name)
+
+        return ""
+
     async def _get_profile_game_name_fallback(self, steamid: str) -> str:
-        """当 API 未返回 gameextrainfo 时，从个人资料 HTML 状态区兜底读取游戏名。"""
+        """当 API 未返回 gameextrainfo 时，从个人资料 HTML 状态区读取游戏名（profile_in_game_header）。"""
         steamid = (steamid or "").strip()
         if not steamid:
             return ""
@@ -855,53 +949,52 @@ class SteamFriendMonitor(Star):
         if cached is not None:
             return str(cached or "").strip()
 
-        profile_url = f"https://steamcommunity.com/profiles/{steamid}/"
-        raw = await self._fetch_url_bytes(
-            profile_url,
-            allowed_types=("text/", "application/xhtml+xml"),
-            max_bytes=1024 * 1024,
-        )
-        if not raw:
-            return ""
-
-        try:
-            page = raw.decode("utf-8", errors="ignore")
-
-            # 只提取 profile_in_game_name（按当前需求，不做其他回退）。
-            # 兼容 class 使用单引号/双引号的场景。
-            in_game_match = re.search(
-                r"<div[^>]*class=['\"][^'\"]*profile_in_game_name[^'\"]*['\"][^>]*>(.*?)</div>",
-                page,
-                re.I | re.S,
+        profile_urls = [
+            f"https://steamcommunity.com/profiles/{steamid}/?l=schinese",
+        ]
+        profile_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        for profile_url in profile_urls:
+            raw = await self._fetch_url_bytes(
+                profile_url,
+                allowed_types=("text/", "application/xhtml+xml"),
+                max_bytes=1024 * 1024,
+                headers=profile_headers,
             )
-            status_html = in_game_match.group(1) if in_game_match else ""
+            if not raw:
+                continue
 
-            if not status_html:
+            try:
+                page = raw.decode("utf-8", errors="ignore")
+                game_name = self._extract_profile_in_game_header_from_html(page)
+
+                if game_name:
+                    self._cache_set(
+                        self.profile_game_cache, steamid, game_name, "profile_game"
+                    )
+                    logger.debug(
+                        f"[steam-monitor] profile fallback game name resolved steamid={steamid} game={game_name} url={profile_url}"
+                    )
+                    return game_name
+                else:
+                    logger.debug(
+                        f"[steam-monitor] profile fallback: profile_in_game_header not found steamid={steamid} url={profile_url}"
+                    )
+            except Exception as e:
                 logger.debug(
-                    "[steam-monitor] profile fallback: profile_in_game_name not found "
-                    f"steamid={steamid}"
+                    f"[steam-monitor] profile fallback parse failed steamid={steamid} url={profile_url}: {e}"
                 )
 
-            state_message = html.unescape(status_html)
-            state_message = re.sub(r"<[^>]+>", " ", state_message)
-            state_message = re.sub(r"\s+", " ", state_message).strip()
-
-            # 按当前策略：提取到的状态文本直接作为游戏名。
-            game_name = state_message
-
-            if game_name:
-                self._cache_set(
-                    self.profile_game_cache, steamid, game_name, "profile_game"
-                )
-                logger.debug(
-                    f"[steam-monitor] profile fallback game name resolved steamid={steamid} game={game_name}"
-                )
-            return game_name
-        except Exception as e:
-            logger.debug(
-                f"[steam-monitor] profile fallback parse failed steamid={steamid}: {e}"
-            )
-            return ""
+        return ""
 
     async def _enrich_players_with_profile_game_fallback(
         self, players: List[Dict[str, Any]]
@@ -910,6 +1003,7 @@ class SteamFriendMonitor(Star):
         if not players or not self._profile_game_fallback_enabled():
             return players
 
+        attempted = 0
         filled = 0
         for p in players:
             st = int(p.get("personastate", 0) or 0)
@@ -918,14 +1012,15 @@ class SteamFriendMonitor(Star):
             if st == 0 or game or not sid:
                 continue
 
+            attempted += 1
             fallback_game = await self._get_profile_game_name_fallback(sid)
             if fallback_game:
                 p["gameextrainfo"] = fallback_game
                 filled += 1
 
-        if filled:
-            logger.debug(
-                f"[steam-monitor] profile fallback enriched players count={filled}"
+        if attempted:
+            logger.info(
+                f"[steam-monitor] profile fallback enrichment attempted={attempted} filled={filled}"
             )
         return players
 
@@ -971,8 +1066,20 @@ class SteamFriendMonitor(Star):
         )
         cached_raw = self._cache_get(self.bytes_cache, url)
         if cached_raw is None:
-            logger.debug(f"[steam-monitor] no cached bytes for url={url}")
-            return None
+            max_bytes = max(
+                256 * 1024,
+                int(
+                    self.config.get("max_image_bytes", 3 * 1024 * 1024)
+                    or 3 * 1024 * 1024
+                ),
+            )
+            cached_raw = self._disk_image_cache_get(url, max_bytes=max_bytes)
+            if cached_raw is not None:
+                self._cache_set(self.bytes_cache, url, cached_raw, "bytes")
+                logger.info(f"[steam-monitor] using disk image cache for url={url}")
+            else:
+                logger.debug(f"[steam-monitor] no cached bytes for url={url}")
+                return None
         
         logger.info(
             f"[steam-monitor] using cached image for url={url} (network error fallback)"
@@ -1088,10 +1195,50 @@ class SteamFriendMonitor(Star):
         )
         return dict(pairs)
 
+    def _format_game_duration(self, seconds: int) -> str:
+        """将秒数格式化为游戏时长显示格式 HH时MM分（不包含数字0）"""
+        if seconds < 0:
+            return ""
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+
+        if hours > 0:
+            return f"{hours}h{minutes}min"
+        elif minutes > 0:
+            return f"{minutes}min"
+        else:
+            return ""
+
+    def _get_game_duration_for_player(self, sid: str, now: datetime) -> str:
+        """获取当前玩家的游戏时长，返回格式化字符串；如果没有在玩游戏则返回空"""
+        target_state = self._get_target_player_state("")
+        record = target_state.get(sid) or self.state.get(sid, {})
+        if not isinstance(record, dict):
+            return ""
+
+        st = int(record.get("personastate", 0) or 0)
+        game = (record.get("gameextrainfo", "") or "").strip()
+        game_start_ts = record.get("game_start_ts")
+
+        # 只在在线且有游戏名且已记录开始时间才显示时长
+        if st == 0 or not game or game_start_ts is None:
+            return ""
+
+        try:
+            with contextlib.suppress(Exception):
+                start_dt = datetime.fromisoformat(game_start_ts)
+                duration_sec = int((now - start_dt).total_seconds())
+                if duration_sec >= 0:
+                    return self._format_game_duration(duration_sec)
+        except Exception:
+            pass
+
+        return ""
+
     def _build_status_image(
         self, players: List[Dict[str, Any]], assets: Dict[str, Dict[str, Any]]
     ) -> str:
-        w = 980
+        w = 800
         row_h = 110
         top = 56
         h = top + row_h * max(1, len(players)) + 20
@@ -1102,7 +1249,8 @@ class SteamFriendMonitor(Star):
         font_text = safe_font(24, self.plugin_dir)
         font_small = safe_font(18, self.plugin_dir)
 
-        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        now_text = now.strftime("%Y-%m-%d %H:%M:%S")
         box = draw.textbbox((0, 0), now_text, font=font_small)
         text_w = box[2] - box[0]
         draw.text(
@@ -1136,9 +1284,18 @@ class SteamFriendMonitor(Star):
             line2 = " | ".join(line2_parts)
             draw.text((112, y + 54), line2, fill=(170, 180, 190), font=font_small)
 
+            # 显示游戏时长
+            game_duration = self._get_game_duration_for_player(sid, now)
+            if game_duration:
+                # 在右侧显示游戏时长
+                duration_text = f"  {game_duration}"
+                box = draw.textbbox((0, 0), duration_text, font=font_small)
+                duration_w = box[2] - box[0]
+                draw.text((w - 230 - duration_w, y + 54), duration_text, fill=(100, 150, 200), font=font_small)
+
             # 在线（state=1）时仅显示绿色圆点，避免与下方状态文案重复。
             if state == 1:
-                dot_x = w - 246
+                dot_x = w - 250
                 dot_y = y + 30
                 draw.ellipse((dot_x, dot_y, dot_x + 12, dot_y + 12), fill=(67, 200, 88))
 
@@ -1195,7 +1352,7 @@ class SteamFriendMonitor(Star):
         await self.context.send_message(umo, chain)
 
     def _compute_next_interval(self, steam_ids: List[str], default_sec: int) -> int:
-        # 基于完整监控集合（配置 ID + state）计算，而不是仅 API 返回列表
+        # 基于完整时间集合（配置 ID + state）计算，而不是仅 API 返回列表
         all_ids = _dedup_keep_order(
             sid
             for sid in (steam_ids + list(self.state.keys()))
@@ -1317,6 +1474,7 @@ class SteamFriendMonitor(Star):
                         "personastate": 0,
                         "gameextrainfo": "",
                         "offline_since": prev_record.get("offline_since", now),
+                        "game_start_ts": None,
                         "ts": now,
                         "missing": True,
                     }
@@ -1340,6 +1498,7 @@ class SteamFriendMonitor(Star):
                 prev_record = target_state.get(sid, {})
                 prev = prev_record.get("personastate")
                 prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
+                prev_game_start_ts = prev_record.get("game_start_ts")
 
                 offline_since = prev_record.get("offline_since", "")
                 if st == 0:
@@ -1348,11 +1507,21 @@ class SteamFriendMonitor(Star):
                 else:
                     offline_since = ""
 
+                # 计算游戏开始时间
+                game_start_ts = prev_game_start_ts
+                if game and (not prev_game or prev_game != game):
+                    # 新游戏开始
+                    game_start_ts = now
+                elif not game:
+                    # 停止游戏
+                    game_start_ts = None
+
                 next_record = {
                     "personaname": p.get("personaname", ""),
                     "personastate": st,
                     "gameextrainfo": game,
                     "offline_since": offline_since,
+                    "game_start_ts": game_start_ts,
                     "ts": now,
                     "missing": False,
                 }
@@ -1372,14 +1541,16 @@ class SteamFriendMonitor(Star):
 
                 if st != 0:
                     if not prev_game and game:
-                        events.append(f"{name} 启动游戏《{game}》")
+                        events.append(f"{name} 启动《{game}》")
                         event_types.add("game_start")
                     elif prev_game and not game:
-                        events.append(f"{name} 关闭游戏《{prev_game}》")
+                        game_duration = self._get_game_duration_for_player(sid, now) or ""
+                        events.append(f"{name} 结束《{prev_game}》, {game_duration}")
                         event_types.add("game_stop")
                     elif prev_game and game and prev_game != game:
+                        game_duration = self._get_game_duration_for_player(sid, now) or ""
                         events.append(
-                            f"{name} 切换游戏《{prev_game}》 -> 《{game}》"
+                            f"{name} 切换游戏《{prev_game}》 -> 《{game}》, {game_duration}"
                         )
                         event_types.add("game_switch")
 
@@ -1499,7 +1670,7 @@ class SteamFriendMonitor(Star):
             ids.append(steam_id64)
         await self._update_config_atomic("steam_ids", ",".join(ids))
         yield event.plain_result(
-            f"已绑定 SteamID64: {steam_id64}，当前监控数量: {len(ids)}"
+            f"已绑定 SteamID64: {steam_id64}，当前时间数量: {len(ids)}"
         )
 
     @filter.command("sfm_del_id")
@@ -1516,7 +1687,7 @@ class SteamFriendMonitor(Star):
         self._save_state()
         await self._update_config_atomic("steam_ids", ",".join(ids))
         yield event.plain_result(
-            f"已移除 SteamID64: {steam_id64}，当前监控数量: {len(ids)}"
+            f"已移除 SteamID64: {steam_id64}，当前时间数量: {len(ids)}"
         )
 
     @filter.command("sfm_set_ids")
@@ -1531,11 +1702,11 @@ class SteamFriendMonitor(Star):
         await self._update_config_atomic("steam_ids", ",".join(valid))
         if invalid:
             yield event.plain_result(
-                f"已设置监控ID数量: {len(valid)}；忽略非法ID {len(invalid)} 个："
+                f"已设置时间ID数量: {len(valid)}；忽略非法ID {len(invalid)} 个："
                 + ", ".join(invalid[:10])
             )
         else:
-            yield event.plain_result(f"已设置监控ID数量: {len(valid)}")
+            yield event.plain_result(f"已设置时间ID数量: {len(valid)}")
 
     @filter.command("sfm_status")
     async def status(self, event: AstrMessageEvent):
@@ -1673,7 +1844,7 @@ class SteamFriendMonitor(Star):
 
     @filter.command("sfm_set_group_ids")
     async def set_group_ids(self, event: AstrMessageEvent, ids: str):
-        """为当前群设置独立的监控 ID"""
+        """为当前群设置独立的时间 ID"""
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
@@ -1691,15 +1862,15 @@ class SteamFriendMonitor(Star):
         
         if invalid:
             yield event.plain_result(
-                f"[当前群] 已设置监控ID数量: {len(valid)}；忽略非法ID {len(invalid)} 个："
+                f"[当前群] 已设置时间ID数量: {len(valid)}；忽略非法ID {len(invalid)} 个："
                 + ", ".join(invalid[:10])
             )
         else:
-            yield event.plain_result(f"[当前群] 已设置监控ID数量: {len(valid)}")
+            yield event.plain_result(f"[当前群] 已设置时间ID数量: {len(valid)}")
 
     @filter.command("sfm_add_group_id")
     async def add_group_id(self, event: AstrMessageEvent, ids: str):
-        """为当前群添加监控 ID（支持逗号/换行批量）"""
+        """为当前群添加时间 ID（支持逗号/换行批量）"""
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
@@ -1723,8 +1894,8 @@ class SteamFriendMonitor(Star):
         await self._update_group_steam_ids_atomic(group_id, current_ids)
 
         msg = (
-            f"[当前群] 批量添加完成：新增 {added} 个，"
-            f"当前监控数量: {len(current_ids)}"
+            f"添加完成：新增 {added} 个，"
+            f"当前时间数量: {len(current_ids)}"
         )
         if invalid:
             msg += (
@@ -1735,9 +1906,9 @@ class SteamFriendMonitor(Star):
 
     @filter.command("sfm_del_group_id")
     async def del_group_id(self, event: AstrMessageEvent, steam_id64: str):
-        """为当前群删除一个监控 ID"""
+        """为当前群删除一个时间 ID"""
         if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
+            yield event.plain_result("无权限")
             return
         
         steam_id64 = (steam_id64 or "").strip()
@@ -1748,18 +1919,18 @@ class SteamFriendMonitor(Star):
             ids.remove(steam_id64)
             await self._update_group_steam_ids_atomic(group_id, ids)
             yield event.plain_result(
-                f"[当前群] 已移除 SteamID64: {steam_id64}，当前监控数量: {len(ids)}"
+                f"[当前群] 已移除 {steam_id64}，当前时间数量: {len(ids)}"
             )
         else:
             yield event.plain_result(
-                "[当前群] 该 SteamID64 不在监控列表中，或未为本群单独设置监控"
+                "[当前群] 该 SteamID64 不在时间列表中，或未为本群单独设置时间"
             )
 
     @filter.command("sfm_group_ids")
     async def show_group_ids(self, event: AstrMessageEvent):
-        """查看当前群的监控 ID 设置"""
+        """查看当前群的时间 ID 设置"""
         if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
+            yield event.plain_result("无权限")
             return
         
         group_id = event.unified_msg_origin
@@ -1769,77 +1940,29 @@ class SteamFriendMonitor(Star):
             global_ids = parse_ids(self.config.get("steam_ids", ""))
             if global_ids:
                 yield event.plain_result(
-                    f"[当前群] 未设置独立监控，使用全局设置({len(global_ids)}个)：\n"
+                    f"未设置独立时间，使用全局配置({len(global_ids)}个)：\n"
                     + ",\n".join(global_ids)
                 )
             else:
-                yield event.plain_result("[当前群] 未设置独立监控，全局也无监控设置")
+                yield event.plain_result("未设置独立时间，也无全局配置")
         else:
             yield event.plain_result(
-                f"[当前群] 独立监控设置({len(group_ids)}个)：\n"
+                f"群独立时间配置({len(group_ids)}个)：\n"
                 + ",\n".join(group_ids)
             )
 
     @filter.command("sfm_clear_group_ids")
     async def clear_group_ids(self, event: AstrMessageEvent):
-        """清除当前群的独立设置，回到全局设置"""
+        """清除当前群的独立配置，回到全局配置"""
         if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
+            yield event.plain_result("无权限")
             return
         
         group_id = event.unified_msg_origin
         if group_id in self.group_configs:
             await self._update_group_steam_ids_atomic(group_id, [])
-            yield event.plain_result("[当前群] 已清除独立设置，将使用全局监控配置")
+            yield event.plain_result("本群已清除独立配置")
         else:
-            yield event.plain_result("[当前群] 未设置独立监控，无需清除")
+            yield event.plain_result("本群未设置独立配置")
 
-    @filter.command("sfm_debug_group")
-    async def debug_group(self, event: AstrMessageEvent):
-        """诊断当前群的配置状态"""
-        if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
-            return
-        
-        group_id = event.unified_msg_origin
-        targets = self._get_targets()
-        group_ids = self._get_group_steam_ids(group_id)
-        global_ids = parse_ids(self.config.get("steam_ids", ""))
-        
-        msg = [
-            "=== 群配置诊断 ===",
-            f"当前群 ID: {group_id}",
-            f"在推送目标中? {'✓ 是' if group_id in targets else '✗ 否'}",
-            f"有独立配置? {'✓ 是' if group_ids is not None else '✗ 否'}",
-            "",
-            f"统计信息:",
-            f"  推送目标数: {len(targets)}",
-            f"  全局 IDs: {len(global_ids)}",
-            f"  群独立 IDs: {len(group_ids) if group_ids else 0}",
-            "",
-        ]
-        
-        # 详细显示全局和群配置
-        if global_ids:
-            msg.append(f"全局 steam_ids: {', '.join(global_ids[:3])}" + 
-                      (f" 等({len(global_ids)}个)" if len(global_ids) > 3 else ""))
-        
-        if group_ids:
-            msg.append(f"群独立 IDs: {', '.join(group_ids[:3])}" + 
-                      (f" 等({len(group_ids)}个)" if len(group_ids) > 3 else ""))
-        
-        # 排查建议
-        msg.extend(["", "建议:"])
-        if group_id not in targets:
-            msg.append("❌ 本群未绑定 → 先执行 /sfm_bind")
-        else:
-            msg.append("✓ 本群已绑定")
-        
-        if group_ids is None:
-            msg.append("⚠  无独立配置 → 使用全局")
-            if not global_ids:
-                msg.append("⚠  全局也无设置 → 执行 /sfm_set_ids")
-        else:
-            msg.append(f"✓ 有独立配置")
-        
-        yield event.plain_result(chr(10).join(msg))
+
