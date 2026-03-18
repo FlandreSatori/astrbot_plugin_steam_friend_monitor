@@ -6,7 +6,7 @@
     "obvious_hint": true
   },
   "steam_ids": {
-    "description": "要监控的 SteamID64（英文逗号分隔）",
+    "description": "全局监控的 SteamID64（英文逗号分隔）",
     "type": "string",
     "default": ""
   },
@@ -20,6 +20,17 @@
     "description": "基础轮询间隔（秒）",
     "type": "int",
     "default": 60
+  },
+  "status_image_min_interval_min": {
+    "description": "状态图片推送最小间隔（分钟，0 表示不限制）",
+    "type": "int",
+    "default": 0
+  },
+  "status_image_trigger_types": {
+    "description": "触发状态图片推送的事件类型（逗号分隔，可多选或留空）",
+    "type": "string",
+    "default": "online,offline,game_start,game_stop,game_switch",
+    "hint": "可选值：online,offline,game_start,game_stop,game_switch；留空表示不因事件自动推送状态图片"
   },
   "online_only": {
     "description": "仅在离线->在线时推送（true）",

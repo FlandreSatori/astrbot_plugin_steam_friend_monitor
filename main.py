@@ -230,6 +230,42 @@ class SteamFriendMonitor(Star):
         async with self._config_lock:
             self._set_targets(targets)
 
+    def _status_image_min_interval_min(self) -> int:
+        return max(
+            0,
+            int(self.config.get("status_image_min_interval_min", 0) or 0),
+        )
+
+    def _status_image_trigger_types(self) -> set[str]:
+        allowed = {
+            "online",
+            "offline",
+            "game_start",
+            "game_stop",
+            "game_switch",
+        }
+        configured = {
+            x.strip().lower()
+            for x in parse_ids(self.config.get("status_image_trigger_types", ""))
+            if x.strip()
+        }
+        return configured & allowed
+
+    def _get_target_last_push_ts(self, target: str) -> float:
+        data = self.state.get("_target_last_push_ts", {})
+        if not isinstance(data, dict):
+            return 0.0
+        with contextlib.suppress(Exception):
+            return float(data.get(target, 0.0) or 0.0)
+        return 0.0
+
+    def _set_target_last_push_ts(self, target: str, ts: float):
+        data = self.state.get("_target_last_push_ts")
+        if not isinstance(data, dict):
+            data = {}
+            self.state["_target_last_push_ts"] = data
+        data[str(target)] = float(ts)
+
     async def _is_host_resolved_private(self, host: str) -> bool:
         host = (host or "").strip()
         if not host:
@@ -1084,7 +1120,8 @@ class SteamFriendMonitor(Star):
             players = await self._fetch_players(steam_ids)
             player_map = {str(p.get("steamid", "")): p for p in players}
 
-            events = []
+            events: List[str] = []
+            event_types: set[str] = set()
             now = now_iso()
             for sid in steam_ids:
                 p = player_map.get(sid)
@@ -1104,10 +1141,12 @@ class SteamFriendMonitor(Star):
                         events.append(
                             f"{prev_record.get('personaname', sid)}: 下线（接口未返回）"
                         )
+                        event_types.add("offline")
                     elif prev is not None and prev_game:
                         events.append(
                             f"{prev_record.get('personaname', sid)}: 关闭游戏《{prev_game}》（接口未返回）"
                         )
+                        event_types.add("game_stop")
                     continue
 
                 st = int(p.get("personastate", 0))
@@ -1139,27 +1178,60 @@ class SteamFriendMonitor(Star):
                 name = p.get("personaname", "?")
                 if prev == 0 and st != 0:
                     events.append(f"{name} 上线 ({persona_text(st)})")
+                    event_types.add("online")
                 elif prev != 0 and st == 0:
                     events.append(f"{name} 下线")
+                    event_types.add("offline")
 
                 if st != 0:
                     if not prev_game and game:
                         events.append(f"{name} 启动游戏《{game}》")
+                        event_types.add("game_start")
                     elif prev_game and not game:
                         events.append(f"{name} 关闭游戏《{prev_game}》")
+                        event_types.add("game_stop")
                     elif prev_game and game and prev_game != game:
                         events.append(
                             f"{name} 切换游戏《{prev_game}》 -> 《{game}》"
                         )
+                        event_types.add("game_switch")
 
             self._save_state()
 
             if events:
+                trigger_types = self._status_image_trigger_types()
+                if not trigger_types:
+                    logger.info(
+                        "[steam-monitor] status image push skipped: status_image_trigger_types is empty"
+                    )
+                    return
+
+                matched_types = event_types & trigger_types
+                if not matched_types:
+                    logger.debug(
+                        "[steam-monitor] status image push skipped by trigger types: "
+                        f"event_types={sorted(event_types)} trigger_types={sorted(trigger_types)}"
+                    )
+                    return
+
+                min_interval = self._status_image_min_interval_min()
+                if min_interval > 0:
+                    now_ts = time.time()
+                    last_push_ts = self._get_target_last_push_ts(target)
+                    if last_push_ts > 0 and (now_ts - last_push_ts) < min_interval * 60:
+                        logger.info(
+                            "[steam-monitor] status image push skipped by interval limit: "
+                            f"target={target} min_interval={min_interval}"
+                        )
+                        return
+
                 ordered_players = self._order_players_by_ids(players, steam_ids)
                 image_path = await self._render_status_image(ordered_players)
                 text = chr(10).join(events)
                 try:
                     await self._push_image(target, text, image_path)
+                    self._set_target_last_push_ts(target, time.time())
+                    self._save_state()
                 except Exception as e:
                     logger.error(f"[steam-monitor] push failed {target}: {e}")
         finally:
