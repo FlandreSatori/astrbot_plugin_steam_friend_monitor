@@ -856,24 +856,8 @@ class SteamFriendMonitor(Star):
             state_message = re.sub(r"<[^>]+>", " ", state_message)
             state_message = re.sub(r"\s+", " ", state_message).strip()
 
-            generic_markers = {
-                "In non-Steam game",
-                "Online",
-                "Offline",
-                "Away",
-                "Busy",
-                "Snooze",
-                "Looking to trade",
-                "Looking to play",
-            }
-            if state_message in generic_markers:
-                game_name = ""
-            else:
-                m = re.match(r"^(?:In-Game|In game)\s+(.+)$", state_message, re.I)
-                if m:
-                    game_name = m.group(1).strip()
-                else:
-                    game_name = state_message
+            # 按当前策略：提取到的状态文本直接作为游戏名。
+            game_name = state_message
 
             self._cache_set(
                 self.profile_game_cache, steamid, game_name, "profile_game"

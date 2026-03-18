@@ -6,6 +6,6 @@ desc: |-
   ·支持手动查询当前状态图
   ·支持为每个群单独设置监控对象
   ·网络不通时自动使用缓存的头像和游戏图片
-version: 0.3.3
+version: 0.3.4
 author: FlandreSatori
 repo: https://github.com/FlandreSatori/astrbot_plugin_steam_friend_monitor
