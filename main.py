@@ -962,13 +962,19 @@ class SteamFriendMonitor(Star):
         logger.info(
             f"[steam-monitor] push image start target={umo} image_path={image_path} text_len={len(text or '')}"
         )
-        chain = MessageChain()
-        items = []
-        if (text or "").strip():
-            items.append(Comp.Plain(text=text))
-        items.append(Comp.Image.fromFileSystem(image_path))
-        chain.chain = items
-        await self.context.send_message(umo, chain)
+        clean_text = "\n".join(
+            line.strip() for line in (text or "").splitlines() if line.strip()
+        )
+
+        # 先发文字，再发图片，避免图文混发导致展示样式不符合预期
+        if clean_text:
+            text_chain = MessageChain()
+            text_chain.chain = [Comp.Plain(text=clean_text)]
+            await self.context.send_message(umo, text_chain)
+
+        image_chain = MessageChain()
+        image_chain.chain = [Comp.Image.fromFileSystem(image_path)]
+        await self.context.send_message(umo, image_chain)
         logger.info(f"[steam-monitor] push image success target={umo} image_path={image_path}")
 
     def _compute_next_interval(self, steam_ids: List[str], default_sec: int) -> int:
@@ -1151,7 +1157,7 @@ class SteamFriendMonitor(Star):
             if events:
                 ordered_players = self._order_players_by_ids(players, steam_ids)
                 image_path = await self._render_status_image(ordered_players)
-                text = "" + chr(10) + chr(10).join(events)
+                text = chr(10).join(events)
                 try:
                     await self._push_image(target, text, image_path)
                 except Exception as e:
@@ -1264,9 +1270,12 @@ class SteamFriendMonitor(Star):
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
-        steam_ids = parse_ids(self.config.get("steam_ids", ""))
+        group_id = event.unified_msg_origin
+        group_ids = self._get_group_steam_ids(group_id)
+        global_ids = parse_ids(self.config.get("steam_ids", ""))
+        steam_ids = group_ids if group_ids is not None else global_ids
         if not steam_ids:
-            yield event.plain_result("未配置 steam_ids")
+            yield event.plain_result("未配置 steam_ids（当前群无独立配置，且全局也为空）")
             return
 
         image_path = None
@@ -1303,13 +1312,17 @@ class SteamFriendMonitor(Star):
             return
 
         action = (action or "all").strip().lower()
-        steam_ids = parse_ids(self.config.get("steam_ids", ""))
+        group_id = event.unified_msg_origin
+        group_ids = self._get_group_steam_ids(group_id)
+        global_ids = parse_ids(self.config.get("steam_ids", ""))
+        steam_ids = group_ids if group_ids is not None else global_ids
         targets = self._get_targets()
 
         if action in ("cfg", "config"):
             msg = [
                 "[steam_monitor_test: config]",
                 f"steam_ids_count={len(steam_ids)}",
+                f"steam_ids_source={'group' if group_ids is not None else 'global'}",
                 f"push_targets_count={len(targets)}",
                 f"poll_interval_sec={self.config.get('poll_interval_sec', 60)}",
                 f"steam_api_key_set={'yes' if bool(self.config.get('steam_api_key', '')) else 'no'}",
@@ -1542,7 +1555,7 @@ class SteamFriendMonitor(Star):
                       (f" 等({len(group_ids)}个)" if len(group_ids) > 3 else ""))
         
         # 排查建议
-        msg.extend(["", "排查指南:"])
+        msg.extend(["", "建议:"])
         if group_id not in targets:
             msg.append("❌ 本群未绑定 → 先执行 /sfm_bind")
         else:
