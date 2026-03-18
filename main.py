@@ -845,12 +845,19 @@ class SteamFriendMonitor(Star):
             page = raw.decode("utf-8", errors="ignore")
 
             # 只提取 profile_in_game_name（按当前需求，不做其他回退）。
+            # 兼容 class 使用单引号/双引号的场景。
             in_game_match = re.search(
-                r'<div[^>]*class="[^"]*profile_in_game_name[^"]*"[^>]*>(.*?)</div>',
+                r"<div[^>]*class=['\"][^'\"]*profile_in_game_name[^'\"]*['\"][^>]*>(.*?)</div>",
                 page,
                 re.I | re.S,
             )
             status_html = in_game_match.group(1) if in_game_match else ""
+
+            if not status_html:
+                logger.debug(
+                    "[steam-monitor] profile fallback: profile_in_game_name not found "
+                    f"steamid={steamid}"
+                )
 
             state_message = html.unescape(status_html)
             state_message = re.sub(r"<[^>]+>", " ", state_message)
