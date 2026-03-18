@@ -903,6 +903,32 @@ class SteamFriendMonitor(Star):
             )
             return ""
 
+    async def _enrich_players_with_profile_game_fallback(
+        self, players: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """统一补全非 Steam 游戏名，确保轮询推送与手动状态图显示一致。"""
+        if not players or not self._profile_game_fallback_enabled():
+            return players
+
+        filled = 0
+        for p in players:
+            st = int(p.get("personastate", 0) or 0)
+            game = (p.get("gameextrainfo", "") or "").strip()
+            sid = str(p.get("steamid", "") or "").strip()
+            if st == 0 or game or not sid:
+                continue
+
+            fallback_game = await self._get_profile_game_name_fallback(sid)
+            if fallback_game:
+                p["gameextrainfo"] = fallback_game
+                filled += 1
+
+        if filled:
+            logger.debug(
+                f"[steam-monitor] profile fallback enriched players count={filled}"
+            )
+        return players
+
     def _process_image_bytes(
         self, raw: bytes, size: tuple[int, int], circle: bool = False
     ) -> Image.Image | None:
@@ -1273,6 +1299,7 @@ class SteamFriendMonitor(Star):
         image_path = None
         try:
             players = await self._fetch_players(steam_ids)
+            players = await self._enrich_players_with_profile_game_fallback(players)
             player_map = {str(p.get("steamid", "")): p for p in players}
             target_state = self._get_target_player_state(target)
 
@@ -1309,10 +1336,6 @@ class SteamFriendMonitor(Star):
 
                 st = int(p.get("personastate", 0))
                 game = (p.get("gameextrainfo", "") or "").strip()
-                if st != 0 and not game and self._profile_game_fallback_enabled():
-                    fallback_game = await self._get_profile_game_name_fallback(sid)
-                    if fallback_game:
-                        game = fallback_game
 
                 prev_record = target_state.get(sid, {})
                 prev = prev_record.get("personastate")
@@ -1530,6 +1553,7 @@ class SteamFriendMonitor(Star):
         image_path = None
         try:
             players = await self._fetch_players(steam_ids)
+            players = await self._enrich_players_with_profile_game_fallback(players)
             ordered_players = self._order_players_by_ids(players, steam_ids)
             image_path = await self._render_status_image(ordered_players)
             await self._push_image(event.unified_msg_origin, "", image_path)
@@ -1586,6 +1610,7 @@ class SteamFriendMonitor(Star):
         image_path = None
         try:
             players = await self._fetch_players(steam_ids)
+            players = await self._enrich_players_with_profile_game_fallback(players)
             ordered_players = self._order_players_by_ids(players, steam_ids)
             status_text = chr(10).join(
                 [
