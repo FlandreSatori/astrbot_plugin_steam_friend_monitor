@@ -1411,12 +1411,12 @@ class SteamFriendMonitor(Star):
             if game_duration:
                 # 统一显示在姓名右侧 50px，并限制到右侧图标区域之外
                 duration_text = game_duration
-                draw.text((duration_x, name_y + 10), duration_text, fill=(100, 150, 200), font=font_small)
+                draw.text((duration_x, name_y + 6), duration_text, fill=(100, 150, 200), font=font_small)
 
             # 在线（state=1）时仅显示绿色圆点，避免与下方状态文案重复。
             if state == 1:
                 dot_x = name_x + name_w + 15
-                dot_y = name_y + 10
+                dot_y = name_y + 13
                 draw.ellipse((dot_x, dot_y, dot_x + 12, dot_y + 12), fill=(67, 200, 88))
 
             game_icon = aset.get("game_icon")
