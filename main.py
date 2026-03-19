@@ -1806,6 +1806,7 @@ class SteamFriendMonitor(Star):
                                 )
                                 pending_prev_game_accum_seconds = 0
                         else:
+                            # 窗口过期后恢复在线：报告下线，但不再报告上线（避免重复）
                             if not pending_confirmed:
                                 events.append(f"{p.get('personaname', '?')} 下线")
                                 event_types.add("offline")
@@ -1821,6 +1822,8 @@ class SteamFriendMonitor(Star):
                                     pending_prev_game_accum_seconds = 0
                                     if game_start_ts == pending_prev_game_start_ts:
                                         game_start_ts = None
+                            # 窗口过期后恢复时抑制上线播报，避免出现"下线"后立即"上线"
+                            suppress_online_event = True
 
                         pending_offline_since = ""
                         pending_prev_game = ""
