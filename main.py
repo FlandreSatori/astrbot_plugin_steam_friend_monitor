@@ -1285,12 +1285,13 @@ class SteamFriendMonitor(Star):
         st = int(record.get("personastate", 0) or 0)
         game = (record.get("gameextrainfo", "") or "").strip()
         game_start_ts = record.get("game_start_ts")
+        game_accum_seconds = self._safe_int(record.get("game_accum_seconds", 0), 0)
 
         # 只在可计时状态且有游戏名且已记录开始时间才显示时长
         if not self._is_duration_countable_state(st) or not game or game_start_ts is None:
             return ""
 
-        duration_sec = self._session_seconds_in_current_cycle(
+        duration_sec = game_accum_seconds + self._session_seconds_in_current_cycle(
             game_start_ts,
             now,
             self._daily_cycle_start_utc8(now),
@@ -1601,12 +1602,16 @@ class SteamFriendMonitor(Star):
                     prev = prev_record.get("personastate")
                     prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
                     prev_game_start_ts = prev_record.get("game_start_ts")
+                    prev_game_accum_seconds = self._safe_int(
+                        prev_record.get("game_accum_seconds", 0), 0
+                    )
 
                     daily_game_seconds = self._safe_int(
                         prev_record.get("daily_game_seconds", 0), 0
                     )
                     if str(prev_record.get("daily_cycle_key", "")) != cycle_key:
                         daily_game_seconds = 0
+                    daily_game_seconds += prev_game_accum_seconds
                     daily_game_seconds += self._session_seconds_in_current_cycle(
                         prev_game_start_ts,
                         now_dt,
@@ -1619,6 +1624,7 @@ class SteamFriendMonitor(Star):
                         "gameextrainfo": "",
                         "offline_since": prev_record.get("offline_since", now),
                         "game_start_ts": None,
+                        "game_accum_seconds": 0,
                         "daily_cycle_key": cycle_key,
                         "daily_game_seconds": daily_game_seconds,
                         "presence_flap_offline_since": prev_record.get(
@@ -1629,6 +1635,10 @@ class SteamFriendMonitor(Star):
                         ),
                         "presence_flap_prev_game_start_ts": prev_record.get(
                             "presence_flap_prev_game_start_ts", prev_game_start_ts
+                        ),
+                        "presence_flap_prev_game_accum_seconds": self._safe_int(
+                            prev_record.get("presence_flap_prev_game_accum_seconds", 0),
+                            prev_game_accum_seconds,
                         ),
                         "presence_flap_confirmed": False,
                         "ts": now,
@@ -1656,6 +1666,10 @@ class SteamFriendMonitor(Star):
                 prev_st = self._safe_int(prev, 0)
                 prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
                 prev_game_start_ts = prev_record.get("game_start_ts")
+                game_accum_seconds = self._safe_int(
+                    prev_record.get("game_accum_seconds", 0), 0
+                )
+                prev_game_accum_seconds = game_accum_seconds
                 pending_offline_since = (
                     prev_record.get("presence_flap_offline_since", "") or ""
                 )
@@ -1664,6 +1678,9 @@ class SteamFriendMonitor(Star):
                 )
                 pending_prev_game_start_ts = prev_record.get(
                     "presence_flap_prev_game_start_ts"
+                )
+                pending_prev_game_accum_seconds = self._safe_int(
+                    prev_record.get("presence_flap_prev_game_accum_seconds", 0), 0
                 )
                 pending_confirmed = bool(prev_record.get("presence_flap_confirmed", False))
 
@@ -1675,14 +1692,35 @@ class SteamFriendMonitor(Star):
 
                 current_countable = self._is_duration_countable_state(st)
                 prev_countable = self._is_duration_countable_state(prev_st)
+                is_offline_candidate = (
+                    flap_suppress_sec > 0 and prev is not None and prev != 0 and st == 0
+                )
 
-                # 游戏停止/切换或退出可计时状态时，将已累计段写入当日总时长
-                if prev_game_start_ts and (not game or prev_game != game or not current_countable):
-                    daily_game_seconds += self._session_seconds_in_current_cycle(
-                        prev_game_start_ts,
-                        now_dt,
-                        cycle_start,
-                    )
+                # 关闭游戏/切换游戏：结算当前段到当日总时长；离开等非计时状态则仅暂停不清零。
+                if prev_game:
+                    game_changed_or_closed = (not game) or (prev_game != game)
+                    if not is_offline_candidate and game_changed_or_closed:
+                        if prev_countable and prev_game_start_ts:
+                            game_accum_seconds += self._session_seconds_in_current_cycle(
+                                prev_game_start_ts,
+                                now_dt,
+                                cycle_start,
+                            )
+                        daily_game_seconds += game_accum_seconds
+                        game_accum_seconds = 0
+                    elif (
+                        not is_offline_candidate
+                        and prev_game == game
+                        and prev_countable
+                        and (not current_countable)
+                    ):
+                        # 仅暂停当前游戏计时，待恢复可计时状态后继续累计。
+                        if prev_game_start_ts:
+                            game_accum_seconds += self._session_seconds_in_current_cycle(
+                                prev_game_start_ts,
+                                now_dt,
+                                cycle_start,
+                            )
 
                 offline_since = prev_record.get("offline_since", "")
                 if st == 0:
@@ -1698,9 +1736,14 @@ class SteamFriendMonitor(Star):
                         start_dt = parse_iso(game_start_ts)
                         if start_dt and start_dt < cycle_start:
                             game_start_ts = cycle_start.isoformat(timespec="seconds")
+                    elif prev_game == game and not prev_countable:
+                        # 从暂停状态恢复：基于已累计秒数继续，而非重置。
+                        game_start_ts = now
                     else:
                         # 新游戏开始，或从不可计时状态恢复为可计时状态
                         game_start_ts = now
+                        if prev_game != game:
+                            game_accum_seconds = 0
                 else:
                     # 不在可计时状态或无游戏时，不持有活跃计时段
                     game_start_ts = None
@@ -1714,6 +1757,7 @@ class SteamFriendMonitor(Star):
                         pending_offline_since = now
                         pending_prev_game = prev_game
                         pending_prev_game_start_ts = prev_game_start_ts
+                        pending_prev_game_accum_seconds = game_accum_seconds
                         pending_confirmed = False
                         suppress_offline_event = True
                     elif prev == 0 and st == 0 and pending_offline_since and not pending_confirmed:
@@ -1721,6 +1765,17 @@ class SteamFriendMonitor(Star):
                         if pending_dt and (now_dt - pending_dt).total_seconds() >= flap_suppress_sec:
                             events.append(f"{p.get('personaname', '?')} 下线")
                             event_types.add("offline")
+                            if pending_prev_game:
+                                pending_end = pending_dt
+                                daily_game_seconds += pending_prev_game_accum_seconds
+                                daily_game_seconds += self._session_seconds_in_current_cycle(
+                                    pending_prev_game_start_ts,
+                                    pending_end,
+                                    cycle_start,
+                                )
+                                game_accum_seconds = 0
+                                game_start_ts = None
+                                pending_prev_game_accum_seconds = 0
                             pending_confirmed = True
                     elif prev == 0 and st != 0 and pending_offline_since:
                         pending_dt = parse_iso(pending_offline_since)
@@ -1739,19 +1794,44 @@ class SteamFriendMonitor(Star):
                             ):
                                 if pending_prev_game_start_ts:
                                     game_start_ts = pending_prev_game_start_ts
+                                    game_accum_seconds = pending_prev_game_accum_seconds
+                            elif pending_prev_game:
+                                # 窗口内恢复但不是同款游戏：按下线时刻结算上一局，避免时长丢失。
+                                pending_end = pending_dt or now_dt
+                                daily_game_seconds += pending_prev_game_accum_seconds
+                                daily_game_seconds += self._session_seconds_in_current_cycle(
+                                    pending_prev_game_start_ts,
+                                    pending_end,
+                                    cycle_start,
+                                )
+                                pending_prev_game_accum_seconds = 0
                         else:
                             if not pending_confirmed:
                                 events.append(f"{p.get('personaname', '?')} 下线")
                                 event_types.add("offline")
+                                if pending_prev_game:
+                                    pending_end = pending_dt or now_dt
+                                    daily_game_seconds += pending_prev_game_accum_seconds
+                                    daily_game_seconds += self._session_seconds_in_current_cycle(
+                                        pending_prev_game_start_ts,
+                                        pending_end,
+                                        cycle_start,
+                                    )
+                                    game_accum_seconds = 0
+                                    pending_prev_game_accum_seconds = 0
+                                    if game_start_ts == pending_prev_game_start_ts:
+                                        game_start_ts = None
 
                         pending_offline_since = ""
                         pending_prev_game = ""
                         pending_prev_game_start_ts = None
+                        pending_prev_game_accum_seconds = 0
                         pending_confirmed = False
                     elif st != 0:
                         pending_offline_since = ""
                         pending_prev_game = ""
                         pending_prev_game_start_ts = None
+                        pending_prev_game_accum_seconds = 0
                         pending_confirmed = False
 
                 next_record = {
@@ -1760,11 +1840,13 @@ class SteamFriendMonitor(Star):
                     "gameextrainfo": game,
                     "offline_since": offline_since,
                     "game_start_ts": game_start_ts,
+                    "game_accum_seconds": game_accum_seconds,
                     "daily_cycle_key": cycle_key,
                     "daily_game_seconds": daily_game_seconds,
                     "presence_flap_offline_since": pending_offline_since,
                     "presence_flap_prev_game": pending_prev_game,
                     "presence_flap_prev_game_start_ts": pending_prev_game_start_ts,
+                    "presence_flap_prev_game_accum_seconds": pending_prev_game_accum_seconds,
                     "presence_flap_confirmed": pending_confirmed,
                     "ts": now,
                     "missing": False,
@@ -1789,13 +1871,15 @@ class SteamFriendMonitor(Star):
                         event_types.add("game_start")
                     elif prev_game and not game:
                         game_duration = self._format_game_duration(
-                            self._session_seconds_total(prev_game_start_ts, now_dt)
+                            prev_game_accum_seconds
+                            + self._session_seconds_total(prev_game_start_ts, now_dt)
                         )
                         events.append(f"{name} 结束《{prev_game}》 {game_duration}")
                         event_types.add("game_stop")
                     elif prev_game and game and prev_game != game:
                         game_duration = self._format_game_duration(
-                            self._session_seconds_total(prev_game_start_ts, now_dt)
+                            prev_game_accum_seconds
+                            + self._session_seconds_total(prev_game_start_ts, now_dt)
                         )
                         events.append(
                             f"{name} 切换游戏《{prev_game}》 -> 《{game}》 {game_duration}"
