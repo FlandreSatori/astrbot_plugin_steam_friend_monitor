@@ -1407,10 +1407,7 @@ class SteamFriendMonitor(Star):
             draw.text((name_x, name_y), name, fill=(240, 240, 240), font=font_text)
             name_box = draw.textbbox((0, 0), name, font=font_text)
             name_w = name_box[2] - name_box[0]
-            line2_parts = [persona_text(state)]
-            if game:
-                line2_parts.append(game)
-            line2 = " | ".join(line2_parts)
+            line2 = game if game else persona_text(state)
             draw.text((112, y + 54), line2, fill=(170, 180, 190), font=font_small)
 
             # 显示游戏时长
