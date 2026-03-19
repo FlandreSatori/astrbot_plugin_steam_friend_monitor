@@ -9,6 +9,6 @@ desc: |-
   ·显示当前游戏游玩时长
   ·图片缓存到本地，避免steam网络不通
   ·频繁上下线可以过滤，增加游玩时长统计
-version: 0.5.0
+version: 0.5.1
 author: FlandreSatori
 repo: https://github.com/FlandreSatori/astrbot_plugin_steam_friend_monitor
