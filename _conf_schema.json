@@ -32,6 +32,12 @@
     "default": 3,
     "hint": "用于过滤网络波动导致的短暂上下线；窗口内离线后恢复同一游戏会延续时长"
   },
+  "count_game_duration_online_only": {
+    "description": "游戏时长仅统计'在线'状态（关闭则在线/离开/忙碌等非离线状态都统计）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后仅 persona=在线 时累计游玩时长；关闭后 persona!=离线 且在玩游戏就累计"
+  },
   "status_text_trigger_types": {
     "description": "触发状态文字推送的事件类型（逗号分隔，可多选或留空）",
     "type": "string",
