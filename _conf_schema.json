@@ -26,6 +26,12 @@
     "type": "int",
     "default": 0
   },
+  "presence_flap_suppress_min": {
+    "description": "上下线抖动抑制窗口（分钟，窗口内重复上下线不播报）",
+    "type": "int",
+    "default": 3,
+    "hint": "用于过滤网络波动导致的短暂上下线；窗口内离线后恢复同一游戏会延续时长"
+  },
   "status_text_trigger_types": {
     "description": "触发状态文字推送的事件类型（逗号分隔，可多选或留空）",
     "type": "string",

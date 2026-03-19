@@ -9,7 +9,7 @@ import platform
 import re
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 import uuid
 from pathlib import Path
@@ -243,6 +243,54 @@ class SteamFriendMonitor(Star):
             0,
             int(self.config.get("status_image_min_interval_min", 0) or 0),
         )
+
+    def _presence_flap_suppress_min(self) -> int:
+        return max(
+            0,
+            int(self.config.get("presence_flap_suppress_min", 0) or 0),
+        )
+
+    def _daily_cycle_key_utc8(self, now: datetime) -> str:
+        cycle_date = now.date()
+        if now.hour < 7:
+            cycle_date = cycle_date - timedelta(days=1)
+        return cycle_date.isoformat()
+
+    def _daily_cycle_start_utc8(self, now: datetime) -> datetime:
+        cycle_date = now.date()
+        if now.hour < 7:
+            cycle_date = cycle_date - timedelta(days=1)
+        return datetime(cycle_date.year, cycle_date.month, cycle_date.day, 7, 0, 0)
+
+    def _session_seconds_in_current_cycle(
+        self, start_ts: str | None, now: datetime, cycle_start: datetime
+    ) -> int:
+        if not start_ts:
+            return 0
+        start_dt = parse_iso(start_ts)
+        if not start_dt:
+            return 0
+        if now <= start_dt:
+            return 0
+        effective_start = max(start_dt, cycle_start)
+        if now <= effective_start:
+            return 0
+        return int((now - effective_start).total_seconds())
+
+    def _session_seconds_total(self, start_ts: str | None, now: datetime) -> int:
+        if not start_ts:
+            return 0
+        start_dt = parse_iso(start_ts)
+        if not start_dt:
+            return 0
+        if now <= start_dt:
+            return 0
+        return int((now - start_dt).total_seconds())
+
+    def _safe_int(self, value: Any, default: int = 0) -> int:
+        with contextlib.suppress(Exception):
+            return int(value)
+        return default
 
     def _parse_trigger_types_config(
         self, config_key: str, default_value: str
@@ -1203,16 +1251,26 @@ class SteamFriendMonitor(Star):
         minutes = (seconds % 3600) // 60
 
         if hours > 0:
-            return f"{hours}h{minutes}min"
+            return f"{hours}h{minutes}m"
         elif minutes > 0:
-            return f"{minutes}min"
+            return f"{minutes}m"
         else:
             return ""
 
-    def _get_game_duration_for_player(self, sid: str, now: datetime) -> str:
+    def _get_game_duration_for_player(
+        self, sid: str, now: datetime, target: str = ""
+    ) -> str:
         """获取当前玩家的游戏时长，返回格式化字符串；如果没有在玩游戏则返回空"""
-        target_state = self._get_target_player_state("")
-        record = target_state.get(sid) or self.state.get(sid, {})
+        record: Dict[str, Any] = {}
+        if target:
+            target_state = self._get_target_player_state(target)
+            data = target_state.get(sid, {})
+            if isinstance(data, dict):
+                record = data
+        if not record:
+            data = self.state.get(sid, {})
+            if isinstance(data, dict):
+                record = data
         if not isinstance(record, dict):
             return ""
 
@@ -1224,19 +1282,78 @@ class SteamFriendMonitor(Star):
         if st == 0 or not game or game_start_ts is None:
             return ""
 
-        try:
-            with contextlib.suppress(Exception):
-                start_dt = datetime.fromisoformat(game_start_ts)
-                duration_sec = int((now - start_dt).total_seconds())
-                if duration_sec >= 0:
-                    return self._format_game_duration(duration_sec)
-        except Exception:
-            pass
+        duration_sec = self._session_seconds_in_current_cycle(
+            game_start_ts,
+            now,
+            self._daily_cycle_start_utc8(now),
+        )
+        if duration_sec > 0:
+            return self._format_game_duration(duration_sec)
 
         return ""
 
+    def _get_daily_game_duration_for_player(
+        self, sid: str, now: datetime, target: str = ""
+    ) -> str:
+        record: Dict[str, Any] = {}
+        if target:
+            target_state = self._get_target_player_state(target)
+            data = target_state.get(sid, {})
+            if isinstance(data, dict):
+                record = data
+        if not record:
+            data = self.state.get(sid, {})
+            if isinstance(data, dict):
+                record = data
+
+        if not isinstance(record, dict):
+            return ""
+
+        cycle_key = self._daily_cycle_key_utc8(now)
+        total_sec = self._safe_int(record.get("daily_game_seconds", 0), 0)
+        if str(record.get("daily_cycle_key", "")) != cycle_key:
+            total_sec = 0
+
+        st = self._safe_int(record.get("personastate", 0), 0)
+        game = (record.get("gameextrainfo", "") or "").strip()
+        if st != 0 and game:
+            total_sec += self._session_seconds_in_current_cycle(
+                record.get("game_start_ts"),
+                now,
+                self._daily_cycle_start_utc8(now),
+            )
+
+        if total_sec <= 0:
+            return "0m"
+        return self._format_game_duration(total_sec) or "0m"
+
+    def _get_display_game_duration_for_player(
+        self, sid: str, now: datetime, target: str = ""
+    ) -> str:
+        record: Dict[str, Any] = {}
+        if target:
+            target_state = self._get_target_player_state(target)
+            data = target_state.get(sid, {})
+            if isinstance(data, dict):
+                record = data
+        if not record:
+            data = self.state.get(sid, {})
+            if isinstance(data, dict):
+                record = data
+        if not isinstance(record, dict):
+            return ""
+
+        st = self._safe_int(record.get("personastate", 0), 0)
+        game = (record.get("gameextrainfo", "") or "").strip()
+        if st != 0 and game:
+            return self._get_game_duration_for_player(sid, now, target)
+        return self._get_daily_game_duration_for_player(sid, now, target)
+
     def _build_status_image(
-        self, players: List[Dict[str, Any]], assets: Dict[str, Dict[str, Any]]
+        self,
+        players: List[Dict[str, Any]],
+        assets: Dict[str, Dict[str, Any]],
+        target: str = "",
     ) -> str:
         w = 800
         row_h = 110
@@ -1285,7 +1402,7 @@ class SteamFriendMonitor(Star):
             draw.text((112, y + 54), line2, fill=(170, 180, 190), font=font_small)
 
             # 显示游戏时长
-            game_duration = self._get_game_duration_for_player(sid, now)
+            game_duration = self._get_display_game_duration_for_player(sid, now, target)
             if game_duration:
                 # 在右侧显示游戏时长
                 duration_text = f"  {game_duration}"
@@ -1315,10 +1432,12 @@ class SteamFriendMonitor(Star):
         finally:
             img.close()
 
-    async def _render_status_image(self, players: List[Dict[str, Any]]) -> str:
+    async def _render_status_image(
+        self, players: List[Dict[str, Any]], target: str = ""
+    ) -> str:
         logger.info(f"[steam-monitor] render status image start players={len(players)}")
         assets = await self._prepare_assets(players)
-        out = await asyncio.to_thread(self._build_status_image, players, assets)
+        out = await asyncio.to_thread(self._build_status_image, players, assets, target)
         logger.info(f"[steam-monitor] render status image done output={out}")
         return out
 
@@ -1462,19 +1581,48 @@ class SteamFriendMonitor(Star):
 
             events: List[str] = []
             event_types: set[str] = set()
-            now = now_iso()
+            now_dt = datetime.now()
+            now = now_dt.isoformat(timespec="seconds")
+            cycle_key = self._daily_cycle_key_utc8(now_dt)
+            cycle_start = self._daily_cycle_start_utc8(now_dt)
+            flap_suppress_sec = self._presence_flap_suppress_min() * 60
             for sid in steam_ids:
                 p = player_map.get(sid)
                 if p is None:
                     prev_record = target_state.get(sid, {})
                     prev = prev_record.get("personastate")
                     prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
+                    prev_game_start_ts = prev_record.get("game_start_ts")
+
+                    daily_game_seconds = self._safe_int(
+                        prev_record.get("daily_game_seconds", 0), 0
+                    )
+                    if str(prev_record.get("daily_cycle_key", "")) != cycle_key:
+                        daily_game_seconds = 0
+                    daily_game_seconds += self._session_seconds_in_current_cycle(
+                        prev_game_start_ts,
+                        now_dt,
+                        cycle_start,
+                    )
+
                     next_record = {
                         "personaname": prev_record.get("personaname", sid),
                         "personastate": 0,
                         "gameextrainfo": "",
                         "offline_since": prev_record.get("offline_since", now),
                         "game_start_ts": None,
+                        "daily_cycle_key": cycle_key,
+                        "daily_game_seconds": daily_game_seconds,
+                        "presence_flap_offline_since": prev_record.get(
+                            "presence_flap_offline_since", now
+                        ),
+                        "presence_flap_prev_game": prev_record.get(
+                            "presence_flap_prev_game", prev_game
+                        ),
+                        "presence_flap_prev_game_start_ts": prev_record.get(
+                            "presence_flap_prev_game_start_ts", prev_game_start_ts
+                        ),
+                        "presence_flap_confirmed": False,
                         "ts": now,
                         "missing": True,
                     }
@@ -1499,6 +1647,30 @@ class SteamFriendMonitor(Star):
                 prev = prev_record.get("personastate")
                 prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
                 prev_game_start_ts = prev_record.get("game_start_ts")
+                pending_offline_since = (
+                    prev_record.get("presence_flap_offline_since", "") or ""
+                )
+                pending_prev_game = (
+                    prev_record.get("presence_flap_prev_game", "") or ""
+                )
+                pending_prev_game_start_ts = prev_record.get(
+                    "presence_flap_prev_game_start_ts"
+                )
+                pending_confirmed = bool(prev_record.get("presence_flap_confirmed", False))
+
+                daily_game_seconds = self._safe_int(
+                    prev_record.get("daily_game_seconds", 0), 0
+                )
+                if str(prev_record.get("daily_cycle_key", "")) != cycle_key:
+                    daily_game_seconds = 0
+
+                # 游戏停止/切换时，将本次会话累计到当日总时长
+                if prev_game and (not game or prev_game != game):
+                    daily_game_seconds += self._session_seconds_in_current_cycle(
+                        prev_game_start_ts,
+                        now_dt,
+                        cycle_start,
+                    )
 
                 offline_since = prev_record.get("offline_since", "")
                 if st == 0:
@@ -1512,9 +1684,57 @@ class SteamFriendMonitor(Star):
                 if game and (not prev_game or prev_game != game):
                     # 新游戏开始
                     game_start_ts = now
+                elif game and prev_game == game and game_start_ts:
+                    start_dt = parse_iso(game_start_ts)
+                    if start_dt and start_dt < cycle_start:
+                        game_start_ts = cycle_start.isoformat(timespec="seconds")
                 elif not game:
                     # 停止游戏
                     game_start_ts = None
+
+                suppress_online_event = False
+                suppress_offline_event = False
+
+                # 抖动抑制：在线->离线先进入候选状态，窗口内恢复不播报上下线
+                if flap_suppress_sec > 0 and prev is not None:
+                    if prev != 0 and st == 0:
+                        pending_offline_since = now
+                        pending_prev_game = prev_game
+                        pending_prev_game_start_ts = prev_game_start_ts
+                        pending_confirmed = False
+                        suppress_offline_event = True
+                    elif prev == 0 and st == 0 and pending_offline_since and not pending_confirmed:
+                        pending_dt = parse_iso(pending_offline_since)
+                        if pending_dt and (now_dt - pending_dt).total_seconds() >= flap_suppress_sec:
+                            events.append(f"{p.get('personaname', '?')} 下线")
+                            event_types.add("offline")
+                            pending_confirmed = True
+                    elif prev == 0 and st != 0 and pending_offline_since:
+                        pending_dt = parse_iso(pending_offline_since)
+                        elapsed = None
+                        if pending_dt:
+                            elapsed = (now_dt - pending_dt).total_seconds()
+
+                        # 窗口内离线后恢复在线：不播报上下线；若恢复同款游戏则延续原开始时间
+                        if elapsed is not None and elapsed < flap_suppress_sec:
+                            suppress_online_event = True
+                            if game and pending_prev_game and game == pending_prev_game:
+                                if pending_prev_game_start_ts:
+                                    game_start_ts = pending_prev_game_start_ts
+                        else:
+                            if not pending_confirmed:
+                                events.append(f"{p.get('personaname', '?')} 下线")
+                                event_types.add("offline")
+
+                        pending_offline_since = ""
+                        pending_prev_game = ""
+                        pending_prev_game_start_ts = None
+                        pending_confirmed = False
+                    elif st != 0:
+                        pending_offline_since = ""
+                        pending_prev_game = ""
+                        pending_prev_game_start_ts = None
+                        pending_confirmed = False
 
                 next_record = {
                     "personaname": p.get("personaname", ""),
@@ -1522,6 +1742,12 @@ class SteamFriendMonitor(Star):
                     "gameextrainfo": game,
                     "offline_since": offline_since,
                     "game_start_ts": game_start_ts,
+                    "daily_cycle_key": cycle_key,
+                    "daily_game_seconds": daily_game_seconds,
+                    "presence_flap_offline_since": pending_offline_since,
+                    "presence_flap_prev_game": pending_prev_game,
+                    "presence_flap_prev_game_start_ts": pending_prev_game_start_ts,
+                    "presence_flap_confirmed": pending_confirmed,
                     "ts": now,
                     "missing": False,
                 }
@@ -1532,10 +1758,10 @@ class SteamFriendMonitor(Star):
                     continue
 
                 name = p.get("personaname", "?")
-                if prev == 0 and st != 0:
-                    events.append(f"{name} 上线 ({persona_text(st)})")
+                if prev == 0 and st != 0 and not suppress_online_event:
+                    events.append(f"{name} 上线")
                     event_types.add("online")
-                elif prev != 0 and st == 0:
+                elif prev != 0 and st == 0 and not suppress_offline_event:
                     events.append(f"{name} 下线")
                     event_types.add("offline")
 
@@ -1544,13 +1770,17 @@ class SteamFriendMonitor(Star):
                         events.append(f"{name} 启动《{game}》")
                         event_types.add("game_start")
                     elif prev_game and not game:
-                        game_duration = self._get_game_duration_for_player(sid, now) or ""
-                        events.append(f"{name} 结束《{prev_game}》, {game_duration}")
+                        game_duration = self._format_game_duration(
+                            self._session_seconds_total(prev_game_start_ts, now_dt)
+                        )
+                        events.append(f"{name} 结束《{prev_game}》 {game_duration}")
                         event_types.add("game_stop")
                     elif prev_game and game and prev_game != game:
-                        game_duration = self._get_game_duration_for_player(sid, now) or ""
+                        game_duration = self._format_game_duration(
+                            self._session_seconds_total(prev_game_start_ts, now_dt)
+                        )
                         events.append(
-                            f"{name} 切换游戏《{prev_game}》 -> 《{game}》, {game_duration}"
+                            f"{name} 切换游戏《{prev_game}》 -> 《{game}》 {game_duration}"
                         )
                         event_types.add("game_switch")
 
@@ -1594,7 +1824,7 @@ class SteamFriendMonitor(Star):
                 try:
                     if send_image:
                         ordered_players = self._order_players_by_ids(players, steam_ids)
-                        image_path = await self._render_status_image(ordered_players)
+                        image_path = await self._render_status_image(ordered_players, target)
                         if send_text:
                             await self._push_image(target, text, image_path)
                         else:
@@ -1726,7 +1956,9 @@ class SteamFriendMonitor(Star):
             players = await self._fetch_players(steam_ids)
             players = await self._enrich_players_with_profile_game_fallback(players)
             ordered_players = self._order_players_by_ids(players, steam_ids)
-            image_path = await self._render_status_image(ordered_players)
+            image_path = await self._render_status_image(
+                ordered_players, event.unified_msg_origin
+            )
             await self._push_image(event.unified_msg_origin, "", image_path)
         except RuntimeError as e:
             logger.error(f"[steam-monitor] status failed: {e}")
@@ -1801,7 +2033,9 @@ class SteamFriendMonitor(Star):
                 )
                 return
 
-            image_path = await self._render_status_image(ordered_players)
+            image_path = await self._render_status_image(
+                ordered_players, event.unified_msg_origin
+            )
             await self._push_image(
                 event.unified_msg_origin,
                 "[steam_monitor_test] 状态拉取成功，测试图如下",
