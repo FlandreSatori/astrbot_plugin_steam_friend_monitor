@@ -164,9 +164,9 @@ class SteamFriendMonitor(Star):
         self.achievement_snapshots: Dict[tuple[str, str, str], List[str]] = {}
         self.achievement_fail_count: Dict[tuple[str, str], int] = {}
 
-    # 字体初始化
-    self.font_paths: Dict[str, str | None] = {}
-    self._ensure_fonts()
+        # 字体初始化
+        self.font_paths: Dict[str, str | None] = {}
+        self._ensure_fonts()
 
     def _load_local_config_defaults(self) -> Dict[str, Any]:
         cfg_path = self.plugin_dir / "config.json"
