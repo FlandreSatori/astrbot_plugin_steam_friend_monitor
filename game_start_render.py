@@ -353,8 +353,11 @@ def render_game_start_image(
     game_name_padded = pad_game_name(game_name, min_cn_len=10)
     game_name_lines = text_wrap(game_name_padded, font, text_area_w)
     line_height = 36
-    # 只为游戏时长多加一行
-    block_height = line_height * (2 + len(game_name_lines)) + 10 + font_small.size + 4
+    # 为在线人数文案固定预留一行高度，避免文案长短影响中部布局
+    has_online_line = online_count is not None
+    online_line_count = 1 if has_online_line else 0
+    # 只为游戏时长多加一行（保持原UI风格）
+    block_height = line_height * (2 + len(game_name_lines) + online_line_count) + 10 + font_small.size + 4
     text_y = (img_h - block_height) // 2
 
     # 将头像Y坐标与玩家名对齐，并下移10像素
@@ -411,7 +414,7 @@ def render_game_start_image(
             font_online = ImageFont.truetype(font_regular, 14)
         except Exception:
             font_online = ImageFont.load_default()
-        online_text = f"●玩家人数{online_count}"
+        online_text = f"\u25CF玩家人数{online_count}"
         text_bbox = draw.textbbox((0, 0), online_text, font=font_online)
         online_text_w = text_bbox[2] - text_bbox[0] + 10  # 加右侧边距
 
@@ -433,23 +436,25 @@ def render_game_start_image(
         font_bold_final = ImageFont.load_default()
     draw.text((text_x + 8, text_y), player_name, font=font_bold_final, fill=(255, 255, 255, 255))
 
+    # 在线人数单独占一行
+    if has_online_line and online_text:
+        draw.text((text_x + 8, text_y + line_height), online_text, font=font_small, fill=(120, 180, 255, 220))
+
     # “正在玩”
-    draw.text((text_x + 8, text_y + line_height), "正在玩", font=font, fill=(200, 255, 200, 255))
+    playing_y = text_y + line_height * (2 if has_online_line else 1)
+    draw.text((text_x + 8, playing_y), "正在玩", font=font, fill=(200, 255, 200, 255))
     # 游戏名多行（亮绿色 129,173,81）
+    game_base_y = playing_y + line_height
     for idx, line in enumerate(game_name_lines):
-        draw.text((text_x + 8, text_y + line_height * 2 + idx * line_height), line, font=font, fill=(129, 173, 81, 255))
+        draw.text((text_x + 8, game_base_y + idx * line_height), line, font=font, fill=(129, 173, 81, 255))
     # 游戏时长（紧跟在最后一行游戏名下方，无多余空行）
     if playtime_hours is not None:
         playtime_str = f"游戏时间 {playtime_hours} 小时"
-        y_time = text_y + line_height * 2 + len(game_name_lines) * line_height + 4  # 仅加4像素间距
+        y_time = game_base_y + len(game_name_lines) * line_height + 4  # 仅加4像素间距
         draw.text((text_x + 8, y_time), playtime_str, font=font_small, fill=(120, 180, 255, 255))
         print(f"[render_game_start_image] 渲染游戏时长: {playtime_str}")
     else:
         print("[render_game_start_image] 未获取到游戏时长，playtime_hours=None")
-
-    # 在线人数渲染（放在最后，确保不会被玩家名遮挡）
-    if online_text:
-        draw.text((IMG_W - online_text_w, 10), online_text, font=font_online, fill=(120, 180, 255, 180))
 
     return img.convert("RGB")
 
