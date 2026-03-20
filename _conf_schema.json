@@ -120,5 +120,17 @@
     "type": "bool",
     "default": true,
     "hint": "用于修复部分网络环境下 Steam 域名被 DNS污染/代理 为私网地址导致的误拦截；关闭后将恢复严格拦截"
+  },
+  "game_start_bg_image": {
+    "description": "游戏开始页面背景图片文件名（必须放在插件目录或数据目录）",
+    "type": "string",
+    "default": "star_767x809.png",
+    "hint": "可填：star_767x809.png、或其他自定义背景图路径（相对于插件目录或绝对路径）"
+  },
+  "game_start_bg_opacity": {
+    "description": "游戏开始页面背景图片不透明度（0.0-1.0）",
+    "type": "float",
+    "default": 0.15,
+    "hint": "0.0 完全透明，1.0 完全不透明；建议范围 0.05-0.3"
   }
 }

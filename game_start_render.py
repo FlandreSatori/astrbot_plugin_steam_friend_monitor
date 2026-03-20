@@ -306,6 +306,8 @@ def render_game_start_image(
     superpower=None,
     online_count=None,
     font_path=None,
+    bg_image_path=None,
+    bg_opacity=0.15,
 ):
     # 字体
     fonts_dir = os.path.join(os.path.dirname(__file__), "fonts")
@@ -327,21 +329,22 @@ def render_game_start_image(
     img = render_gradient_bg(img_w, img_h, BG_COLOR_TOP, BG_COLOR_BOTTOM).convert("RGBA")
     draw = ImageDraw.Draw(img)
 
-    # 1. 背景星星横向平铺（等比例缩放高度，透明度30%）
+    # 1. 背景图片横向平铺（等比例缩放高度，透明度可配），如果bg_image_path为None则使用默认星星
+    bg_path = bg_image_path if bg_image_path else STAR_BG_PATH
     try:
-        star_bg = Image.open(STAR_BG_PATH).convert("RGBA")
-        star_w, star_h = star_bg.size
-        scale = IMG_H / star_h
-        new_w = int(star_w * scale)
+        bg_img = Image.open(bg_path).convert("RGBA")
+        bg_w, bg_h = bg_img.size
+        scale = IMG_H / bg_h
+        new_w = int(bg_w * scale)
         new_h = IMG_H
-        star_bg_resized = star_bg.resize((new_w, new_h), Image.LANCZOS)
-        # 设置透明度30%
-        alpha = star_bg_resized.split()[-1].point(lambda p: int(p * 0.3))
-        star_bg_resized.putalpha(alpha)
+        bg_resized = bg_img.resize((new_w, new_h), Image.LANCZOS)
+        # 设置透明度
+        alpha = bg_resized.split()[-1].point(lambda p: int(p * bg_opacity))
+        bg_resized.putalpha(alpha)
         for x in range(0, IMG_W, new_w):
-            img.alpha_composite(star_bg_resized, (x, 0))
+            img.alpha_composite(bg_resized, (x, 0))
     except Exception as e:
-        print(f"[render_game_start_image] 星星背景加载失败: {e}")
+        print(f"[render_game_start_image] 背景图片加载失败 (bg_path={bg_path}): {e}")
 
     # 2. 封面图贴左，等比例缩放高度，宽度自适应，左贴右留空，不裁剪
     cover_area_h = IMG_H
@@ -457,6 +460,8 @@ async def render_game_start(
     appid=None,
     sgdb_api_base=None,
     steam_api_base=None,
+    bg_image_path=None,
+    bg_opacity=0.15,
 ):
     print(f"[render_game_start] superpower参数: {superpower}")
     avatar_path = get_avatar_path(data_dir, steamid, avatar_url)
@@ -481,6 +486,8 @@ async def render_game_start(
         superpower,
         online_count,
         font_path=font_path,
+        bg_image_path=bg_image_path,
+        bg_opacity=bg_opacity,
     )
     buf = io.BytesIO()
     img.save(buf, format="PNG")

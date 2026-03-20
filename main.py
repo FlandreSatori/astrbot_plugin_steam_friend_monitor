@@ -5,6 +5,7 @@ import html
 from html.parser import HTMLParser
 import ipaddress
 import json
+import os
 import platform
 import random
 import re
@@ -898,6 +899,19 @@ class SteamFriendMonitor(Star):
                 self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf"
             )
 
+            # 读取背景配置
+            bg_image_path = None
+            bg_image_name = self.config.get("game_start_bg_image", "star_767x809.png")
+            if bg_image_name:
+                # 先从数据目录找，再从插件目录找
+                bg_path_data = os.path.join(str(self.data_dir), bg_image_name)
+                bg_path_plugin = os.path.join(str(self.plugin_dir), bg_image_name)
+                if os.path.exists(bg_path_data):
+                    bg_image_path = bg_path_data
+                elif os.path.exists(bg_path_plugin):
+                    bg_image_path = bg_path_plugin
+            bg_opacity = float(self.config.get("game_start_bg_opacity", 0.15))
+
             img_bytes = await render_game_start(
                 str(self.data_dir),
                 sid,
@@ -914,6 +928,8 @@ class SteamFriendMonitor(Star):
                 appid=gameid,
                 sgdb_api_base=self.SGDB_API_BASE,
                 steam_api_base=self.STEAM_API_BASE,
+                bg_image_path=bg_image_path,
+                bg_opacity=bg_opacity,
             )
             with tempfile.NamedTemporaryFile(
                 delete=False,
