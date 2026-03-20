@@ -50,6 +50,59 @@
     "default": "online,offline,game_start,game_stop,game_switch",
     "hint": "可选值：online,offline,game_start,game_stop,game_switch；留空表示不因事件自动推送状态图片"
   },
+  "enable_achievement_monitor": {
+    "description": "是否开启成就监控",
+    "type": "bool",
+    "default": true
+  },
+  "achievement_poll_interval_sec": {
+    "description": "成就轮询间隔（秒）",
+    "type": "int",
+    "default": 1200,
+    "hint": "玩家在游戏中时周期对比已解锁成就，建议不低于 300 秒"
+  },
+  "achievement_final_check_delay_sec": {
+    "description": "游戏结束后成就补偿检查延迟（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "用于捕获 Steam 接口延迟上报的解锁成就"
+  },
+  "achievement_fail_limit_per_day": {
+    "description": "同一游戏单日成就接口失败阈值",
+    "type": "int",
+    "default": 10,
+    "hint": "达到阈值后自动加入成就黑名单，减少无效请求"
+  },
+  "max_achievement_notifications": {
+    "description": "单次最多推送的新成就数量",
+    "type": "int",
+    "default": 5
+  },
+  "enable_game_start_render": {
+    "description": "是否启用开始游戏图片渲染推送",
+    "type": "bool",
+    "default": true
+  },
+  "steam_api_base": {
+    "description": "Steam API 基础地址",
+    "type": "string",
+    "default": "https://api.steampowered.com"
+  },
+  "steam_store_base": {
+    "description": "Steam Store API 基础地址",
+    "type": "string",
+    "default": "https://store.steampowered.com"
+  },
+  "sgdb_api_key": {
+    "description": "SteamGridDB API Key（用于高质量竖版封面）",
+    "type": "string",
+    "default": ""
+  },
+  "sgdb_api_base": {
+    "description": "SteamGridDB API 基础地址",
+    "type": "string",
+    "default": "https://www.steamgriddb.com"
+  },
   "enable_profile_game_fallback": {
     "description": "当 API 未返回游戏名时，尝试从个人资料页面读取（支持部分非 Steam 游戏）",
     "type": "bool",

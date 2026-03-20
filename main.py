@@ -6,7 +6,9 @@ from html.parser import HTMLParser
 import ipaddress
 import json
 import platform
+import random
 import re
+import tempfile
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
@@ -18,6 +20,9 @@ from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont
+
+from .achievement_monitor import AchievementMonitor
+from .game_start_render import render_game_start
 
 from astrbot.api import AstrBotConfig, logger
 import astrbot.api.message_components as Comp
@@ -128,14 +133,56 @@ class SteamFriendMonitor(Star):
         self._stop = False
         self._task: asyncio.Task | None = None
 
+        self.local_config_defaults = self._load_local_config_defaults()
+        self.STEAM_API_BASE = self._normalize_base_url(
+            self.config.get("steam_api_base", self.local_config_defaults.get("steam_api_base", "")),
+            "https://api.steampowered.com",
+        )
+        self.STEAM_STORE_BASE = self._normalize_base_url(
+            self.config.get("steam_store_base", self.local_config_defaults.get("steam_store_base", "")),
+            "https://store.steampowered.com",
+        )
+        self.SGDB_API_KEY = str(
+            self.config.get("sgdb_api_key", self.local_config_defaults.get("sgdb_api_key", ""))
+            or ""
+        )
+        self.SGDB_API_BASE = self._normalize_base_url(
+            self.config.get("sgdb_api_base", self.local_config_defaults.get("sgdb_api_base", "")),
+            "https://www.steamgriddb.com",
+        )
+
         self.http: httpx.AsyncClient | None = None
         self.bytes_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self.icon_url_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self.profile_game_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self._game_name_cache: Dict[str, tuple[str, str]] = {}
         self._config_lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task] = set()
+        self.achievement_monitor = AchievementMonitor(self.data_dir)
+        self.achievement_poll_tasks: Dict[tuple[str, str, str], asyncio.Task] = {}
+        self.achievement_final_tasks: Dict[tuple[str, str, str], asyncio.Task] = {}
+        self.achievement_snapshots: Dict[tuple[str, str, str], List[str]] = {}
+        self.achievement_fail_count: Dict[tuple[str, str], int] = {}
+
+    def _load_local_config_defaults(self) -> Dict[str, Any]:
+        cfg_path = self.plugin_dir / "config.json"
+        if not cfg_path.exists():
+            return {}
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            logger.warning(f"[steam-monitor] load local config.json failed: {e}")
+        return {}
+
+    def _normalize_base_url(self, value: Any, default: str) -> str:
+        if not value:
+            return default
+        return str(value).rstrip("/")
 
     async def initialize(self):
+        self.achievement_monitor.steam_api_base = self.STEAM_API_BASE
         self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
         self._task = asyncio.create_task(self._poll_loop())
         logger.info(
@@ -165,6 +212,15 @@ class SteamFriendMonitor(Star):
         for t in list(self._bg_tasks):
             t.cancel()
         self._bg_tasks.clear()
+
+        for t in list(self.achievement_poll_tasks.values()):
+            t.cancel()
+        self.achievement_poll_tasks.clear()
+        for t in list(self.achievement_final_tasks.values()):
+            t.cancel()
+        self.achievement_final_tasks.clear()
+        self.achievement_snapshots.clear()
+
         if self.http:
             await self.http.aclose()
             self.http = None
@@ -421,6 +477,419 @@ class SteamFriendMonitor(Star):
         task = asyncio.create_task(self._delayed_unlink(image_path, delay_sec))
         self._bg_tasks.add(task)
         task.add_done_callback(lambda t: self._bg_tasks.discard(t))
+
+    def _spawn_bg_task(self, coro: Any) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(lambda t: self._bg_tasks.discard(t))
+        return task
+
+    def _achievement_enabled(self) -> bool:
+        default = self.local_config_defaults.get("enable_achievement_monitor", True)
+        return bool(self.config.get("enable_achievement_monitor", default))
+
+    def _achievement_poll_interval_sec(self) -> int:
+        default = self.local_config_defaults.get("achievement_poll_interval_sec", 1200)
+        return max(60, int(self.config.get("achievement_poll_interval_sec", default) or default))
+
+    def _achievement_final_delay_sec(self) -> int:
+        default = self.local_config_defaults.get("achievement_final_check_delay_sec", 300)
+        return max(60, int(self.config.get("achievement_final_check_delay_sec", default) or default))
+
+    def _achievement_fail_limit(self) -> int:
+        default = self.local_config_defaults.get("achievement_fail_limit_per_day", 10)
+        return max(1, int(self.config.get("achievement_fail_limit_per_day", default) or default))
+
+    def _achievement_max_notify(self) -> int:
+        default = self.local_config_defaults.get("max_achievement_notifications", 5)
+        return max(1, int(self.config.get("max_achievement_notifications", default) or default))
+
+    def _achievement_key(self, target: str, sid: str, gameid: str) -> tuple[str, str, str]:
+        return (str(target), str(sid), str(gameid))
+
+    async def _start_achievement_monitoring(
+        self,
+        target: str,
+        sid: str,
+        gameid: str,
+        player_name: str,
+        game_name: str,
+    ):
+        if not self._achievement_enabled():
+            return
+        api_key = str(self.config.get("steam_api_key", "")).strip()
+        gameid = str(gameid or "").strip()
+        if not api_key or not sid or not gameid:
+            return
+
+        key = self._achievement_key(target, sid, gameid)
+        old_final = self.achievement_final_tasks.pop(key, None)
+        if old_final:
+            old_final.cancel()
+
+        if key in self.achievement_poll_tasks:
+            return
+
+        try:
+            achievements = await self.achievement_monitor.get_player_achievements(
+                api_key,
+                target,
+                sid,
+                gameid,
+            )
+            self.achievement_snapshots[key] = list(achievements) if achievements else []
+            poll_task = asyncio.create_task(
+                self._achievement_periodic_check(
+                    target,
+                    sid,
+                    gameid,
+                    player_name,
+                    game_name,
+                )
+            )
+            self.achievement_poll_tasks[key] = poll_task
+            poll_task.add_done_callback(lambda t: self.achievement_poll_tasks.pop(key, None))
+        except Exception as e:
+            logger.warning(
+                f"[steam-monitor] start achievement monitoring failed sid={sid} gameid={gameid}: {e}"
+            )
+
+    def _schedule_achievement_final_check(
+        self,
+        target: str,
+        sid: str,
+        gameid: str,
+        player_name: str,
+        game_name: str,
+    ):
+        gameid = str(gameid or "").strip()
+        if not gameid:
+            return
+        key = self._achievement_key(target, sid, gameid)
+
+        poll_task = self.achievement_poll_tasks.pop(key, None)
+        if poll_task:
+            poll_task.cancel()
+
+        old_final = self.achievement_final_tasks.pop(key, None)
+        if old_final:
+            old_final.cancel()
+
+        final_task = asyncio.create_task(
+            self._achievement_delayed_final_check(
+                target,
+                sid,
+                gameid,
+                player_name,
+                game_name,
+            )
+        )
+        self.achievement_final_tasks[key] = final_task
+        final_task.add_done_callback(lambda t: self.achievement_final_tasks.pop(key, None))
+
+    async def _achievement_periodic_check(
+        self,
+        target: str,
+        sid: str,
+        gameid: str,
+        player_name: str,
+        game_name: str,
+    ):
+        key = self._achievement_key(target, sid, gameid)
+        api_key = str(self.config.get("steam_api_key", "")).strip()
+        interval_sec = self._achievement_poll_interval_sec()
+        try:
+            while not self._stop:
+                await asyncio.sleep(interval_sec)
+                if gameid in self.achievement_monitor.achievement_blacklist:
+                    break
+
+                before = set(self.achievement_snapshots.get(key, []))
+                current = await self.achievement_monitor.get_player_achievements(
+                    api_key,
+                    target,
+                    sid,
+                    gameid,
+                )
+                today = datetime.now().strftime("%Y-%m-%d")
+                fail_key = (gameid, today)
+                if current is None:
+                    cnt = self.achievement_fail_count.get(fail_key, 0) + 1
+                    self.achievement_fail_count[fail_key] = cnt
+                    if cnt >= self._achievement_fail_limit():
+                        self.achievement_monitor.achievement_blacklist.add(gameid)
+                        self.achievement_monitor._save_blacklist()
+                        logger.info(
+                            f"[steam-monitor] achievement app blacklisted appid={gameid} fail_count={cnt}"
+                        )
+                        break
+                    continue
+
+                new_achievements = set(current) - before
+                if new_achievements:
+                    await self._notify_new_achievements(
+                        target,
+                        sid,
+                        player_name,
+                        gameid,
+                        game_name,
+                        new_achievements,
+                    )
+                self.achievement_snapshots[key] = list(current)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(
+                f"[steam-monitor] achievement periodic check failed sid={sid} gameid={gameid}: {e}"
+            )
+
+    async def _achievement_delayed_final_check(
+        self,
+        target: str,
+        sid: str,
+        gameid: str,
+        player_name: str,
+        game_name: str,
+    ):
+        key = self._achievement_key(target, sid, gameid)
+        try:
+            await asyncio.sleep(self._achievement_final_delay_sec())
+            if gameid in self.achievement_monitor.achievement_blacklist:
+                return
+
+            api_key = str(self.config.get("steam_api_key", "")).strip()
+            before = set(self.achievement_snapshots.get(key, []))
+            current = await self.achievement_monitor.get_player_achievements(
+                api_key,
+                target,
+                sid,
+                gameid,
+            )
+            if current is None:
+                return
+
+            new_achievements = set(current) - before
+            if new_achievements:
+                await self._notify_new_achievements(
+                    target,
+                    sid,
+                    player_name,
+                    gameid,
+                    game_name,
+                    new_achievements,
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(
+                f"[steam-monitor] achievement final check failed sid={sid} gameid={gameid}: {e}"
+            )
+        finally:
+            self.achievement_snapshots.pop(key, None)
+            self.achievement_monitor.clear_game_achievements(target, sid, gameid)
+
+    async def _notify_new_achievements(
+        self,
+        target: str,
+        sid: str,
+        player_name: str,
+        gameid: str,
+        game_name: str,
+        new_achievements: set[str],
+    ):
+        if not self._achievement_enabled() or not new_achievements:
+            return
+
+        achievements_to_notify = list(new_achievements)[: self._achievement_max_notify()]
+        extra_count = len(new_achievements) - len(achievements_to_notify)
+        key = self._achievement_key(target, sid, gameid)
+        api_key = str(self.config.get("steam_api_key", "")).strip()
+
+        details: Dict[str, Any] = {}
+        try:
+            details = await self.achievement_monitor.get_achievement_details(
+                target,
+                gameid,
+                lang="schinese",
+                api_key=api_key,
+                steamid=sid,
+            )
+        except Exception as e:
+            logger.debug(f"[steam-monitor] get achievement details failed appid={gameid}: {e}")
+
+        if details and game_name:
+            for d in details.values():
+                if isinstance(d, dict):
+                    d["game_name"] = game_name
+
+        if details:
+            try:
+                unlocked_set = await self.achievement_monitor.get_player_achievements(
+                    api_key,
+                    target,
+                    sid,
+                    gameid,
+                )
+                if not unlocked_set:
+                    unlocked_set = set(self.achievement_snapshots.get(key, []))
+                if unlocked_set is None:
+                    unlocked_set = set()
+
+                font_path = str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
+                if not Path(font_path).exists():
+                    font_path = ""
+
+                img_bytes = await self.achievement_monitor.render_achievement_image(
+                    details,
+                    set(achievements_to_notify),
+                    player_name=player_name,
+                    steamid=sid,
+                    appid=gameid,
+                    unlocked_set=unlocked_set,
+                    font_path=font_path,
+                    api_key=api_key,
+                    target=target,
+                )
+                with tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=".png",
+                    dir=str(self.data_dir),
+                ) as tmp:
+                    tmp.write(img_bytes)
+                    tmp_path = tmp.name
+
+                image_chain = MessageChain()
+                image_chain.chain = [Comp.Image.fromFileSystem(tmp_path)]
+                await self.context.send_message(target, image_chain)
+                self._schedule_delayed_unlink(tmp_path, 30)
+                return
+            except Exception as e:
+                logger.warning(f"[steam-monitor] achievement image render failed appid={gameid}: {e}")
+
+        lines = [f"{player_name} 在《{game_name or gameid}》解锁了新成就："]
+        for apiname in achievements_to_notify:
+            detail = details.get(apiname, {}) if isinstance(details, dict) else {}
+            show_name = str(detail.get("name") or apiname)
+            desc = str(detail.get("description") or "").strip()
+            if desc:
+                lines.append(f"- {show_name}: {desc}")
+            else:
+                lines.append(f"- {show_name}")
+        if extra_count > 0:
+            lines.append(f"... 以及另外 {extra_count} 个成就")
+
+        await self._push_text(target, "\n".join(lines))
+
+    def _game_start_render_enabled(self) -> bool:
+        default = self.local_config_defaults.get("enable_game_start_render", True)
+        return bool(self.config.get("enable_game_start_render", default))
+
+    async def _get_game_names(
+        self, gameid: str, fallback_name: str | None = None
+    ) -> tuple[str, str]:
+        if not gameid:
+            fallback = fallback_name or "未知游戏"
+            return (fallback, fallback)
+
+        gid = str(gameid)
+        if gid in self._game_name_cache:
+            return self._game_name_cache[gid]
+
+        url_zh = f"{self.STEAM_STORE_BASE}/api/appdetails?appids={gid}&l=schinese"
+        url_en = f"{self.STEAM_STORE_BASE}/api/appdetails?appids={gid}&l=en"
+        name_zh = fallback_name or "未知游戏"
+        name_en = fallback_name or "未知游戏"
+
+        try:
+            if not self.http:
+                self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
+            resp_zh = await self.http.get(url_zh)
+            data_zh = resp_zh.json()
+            info_zh = data_zh.get(gid, {}).get("data", {})
+            name_zh = info_zh.get("name") or name_zh
+
+            resp_en = await self.http.get(url_en)
+            data_en = resp_en.json()
+            info_en = data_en.get(gid, {}).get("data", {})
+            name_en = info_en.get("name") or name_en
+        except Exception as e:
+            logger.debug(f"[steam-monitor] get game names failed gameid={gid}: {e}")
+
+        self._game_name_cache[gid] = (name_zh, name_en)
+        return (name_zh, name_en)
+
+    async def _get_game_online_count(self, gameid: str) -> int | None:
+        gid = str(gameid or "").strip()
+        if not gid:
+            return None
+
+        url = f"{self.STEAM_API_BASE}/ISteamUserStats/GetNumberOfCurrentPlayers/v1/?appid={gid}"
+        try:
+            if not self.http:
+                self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
+            resp = await self.http.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("response", {}).get("player_count")
+        except Exception as e:
+            logger.debug(f"[steam-monitor] get online count failed gameid={gid}: {e}")
+        return None
+
+    async def _push_game_start_render(
+        self,
+        target: str,
+        sid: str,
+        player_name: str,
+        avatar_url: str,
+        gameid: str,
+        game_name: str,
+    ):
+        if not self._game_start_render_enabled():
+            return
+
+        try:
+            zh_game_name, en_game_name = await self._get_game_names(gameid, game_name)
+            online_count = await self._get_game_online_count(gameid)
+            font_path = str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
+            if not Path(font_path).exists():
+                font_path = ""
+
+            img_bytes = await render_game_start(
+                str(self.data_dir),
+                sid,
+                player_name,
+                avatar_url,
+                gameid,
+                zh_game_name,
+                api_key=str(self.config.get("steam_api_key", "")),
+                superpower=None,
+                sgdb_api_key=self.SGDB_API_KEY,
+                font_path=font_path,
+                sgdb_game_name=en_game_name,
+                online_count=online_count,
+                appid=gameid,
+                sgdb_api_base=self.SGDB_API_BASE,
+                steam_api_base=self.STEAM_API_BASE,
+            )
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".png",
+                dir=str(self.data_dir),
+            ) as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
+
+            chain = MessageChain()
+            chain.chain = [
+                Comp.Plain(text=f"🟢【{player_name}】开始游玩 {zh_game_name}"),
+                Comp.Image.fromFileSystem(tmp_path),
+            ]
+            await self.context.send_message(target, chain)
+            self._schedule_delayed_unlink(tmp_path, 30)
+        except Exception as e:
+            logger.warning(
+                f"[steam-monitor] push game start render failed sid={sid} gameid={gameid}: {e}"
+            )
 
     def _cache_ttl(self) -> int:
         return max(60, int(self.config.get("cache_ttl_sec", 3600) or 3600))
@@ -1601,6 +2070,7 @@ class SteamFriendMonitor(Star):
                     prev_record = target_state.get(sid, {})
                     prev = prev_record.get("personastate")
                     prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
+                    prev_gameid = str(prev_record.get("gameid", "") or "").strip()
                     prev_game_start_ts = prev_record.get("game_start_ts")
                     prev_game_accum_seconds = self._safe_int(
                         prev_record.get("game_accum_seconds", 0), 0
@@ -1621,6 +2091,7 @@ class SteamFriendMonitor(Star):
                     next_record = {
                         "personaname": prev_record.get("personaname", sid),
                         "personastate": 0,
+                        "gameid": "",
                         "gameextrainfo": "",
                         "offline_since": prev_record.get("offline_since", now),
                         "game_start_ts": None,
@@ -1656,14 +2127,24 @@ class SteamFriendMonitor(Star):
                             f"{prev_record.get('personaname', sid)}: 关闭游戏《{prev_game}》（接口未返回）"
                         )
                         event_types.add("game_stop")
+                    if prev_gameid:
+                        self._schedule_achievement_final_check(
+                            target,
+                            sid,
+                            prev_gameid,
+                            prev_record.get("personaname", sid),
+                            prev_game or prev_gameid,
+                        )
                     continue
 
                 st = int(p.get("personastate", 0))
+                current_gameid = str(p.get("gameid", "") or "").strip()
                 game = (p.get("gameextrainfo", "") or "").strip()
 
                 prev_record = target_state.get(sid, {})
                 prev = prev_record.get("personastate")
                 prev_st = self._safe_int(prev, 0)
+                prev_gameid = str(prev_record.get("gameid", "") or "").strip()
                 prev_game = (prev_record.get("gameextrainfo", "") or "").strip()
                 prev_game_start_ts = prev_record.get("game_start_ts")
                 game_accum_seconds = self._safe_int(
@@ -1840,6 +2321,7 @@ class SteamFriendMonitor(Star):
                 next_record = {
                     "personaname": p.get("personaname", ""),
                     "personastate": st,
+                    "gameid": current_gameid,
                     "gameextrainfo": game,
                     "offline_since": offline_since,
                     "game_start_ts": game_start_ts,
@@ -1869,9 +2351,23 @@ class SteamFriendMonitor(Star):
                     event_types.add("offline")
 
                 if st != 0:
+                    avatar_url = (
+                        str(p.get("avatarfull") or p.get("avatarmedium") or p.get("avatar") or "")
+                    )
                     if not prev_game and game:
                         events.append(f"{name} 启动《{game}》")
                         event_types.add("game_start")
+                        if current_gameid:
+                            self._spawn_bg_task(
+                                self._push_game_start_render(
+                                    target,
+                                    sid,
+                                    name,
+                                    avatar_url,
+                                    current_gameid,
+                                    game,
+                                )
+                            )
                     elif prev_game and not game:
                         game_duration = self._format_game_duration(
                             prev_game_accum_seconds
@@ -1888,6 +2384,38 @@ class SteamFriendMonitor(Star):
                             f"{name} 切换游戏《{prev_game}》 -> 《{game}》 {game_duration}"
                         )
                         event_types.add("game_switch")
+                        if current_gameid:
+                            self._spawn_bg_task(
+                                self._push_game_start_render(
+                                    target,
+                                    sid,
+                                    name,
+                                    avatar_url,
+                                    current_gameid,
+                                    game,
+                                )
+                            )
+
+                # 成就监控生命周期：开始游戏启动，结束/切换/掉线做延迟结算
+                if self._achievement_enabled():
+                    if prev_gameid and prev_gameid != current_gameid:
+                        self._schedule_achievement_final_check(
+                            target,
+                            sid,
+                            prev_gameid,
+                            name,
+                            prev_game or prev_gameid,
+                        )
+                    if current_gameid and current_gameid != prev_gameid:
+                        self._spawn_bg_task(
+                            self._start_achievement_monitoring(
+                                target,
+                                sid,
+                                current_gameid,
+                                name,
+                                game or current_gameid,
+                            )
+                        )
 
             self._save_state()
 
@@ -2180,6 +2708,175 @@ class SteamFriendMonitor(Star):
         finally:
             if image_path:
                 self._schedule_delayed_unlink(image_path, 30)
+
+    @filter.command("steam test_achievement_render")
+    async def steam_test_achievement_render(
+        self,
+        event: AstrMessageEvent,
+        steamid: str,
+        gameid: int,
+        count: int = 3,
+    ):
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+
+        gid = str(gameid)
+        api_key = str(self.config.get("steam_api_key", "")).strip()
+        if not api_key:
+            yield event.plain_result("未配置 steam_api_key")
+            return
+
+        achievements = await self.achievement_monitor.get_player_achievements(
+            api_key,
+            event.unified_msg_origin,
+            steamid,
+            gid,
+        )
+        if not achievements:
+            yield event.plain_result("未获取到任何成就，可能为隐私或无成就")
+            return
+
+        details = await self.achievement_monitor.get_achievement_details(
+            event.unified_msg_origin,
+            gid,
+            lang="schinese",
+            api_key=api_key,
+            steamid=steamid,
+        )
+        if not details:
+            yield event.plain_result("获取成就详情失败")
+            return
+
+        for d in details.values():
+            if isinstance(d, dict):
+                d["game_name"] = "测试渲染"
+
+        sample_count = max(1, min(int(count or 1), len(achievements)))
+        unlocked = set(random.sample(list(achievements), sample_count))
+        font_path = str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
+        if not Path(font_path).exists():
+            font_path = ""
+
+        try:
+            img_bytes = await self.achievement_monitor.render_achievement_image(
+                details,
+                unlocked,
+                player_name=steamid,
+                steamid=steamid,
+                appid=gid,
+                unlocked_set=set(achievements),
+                font_path=font_path,
+                api_key=api_key,
+                target=event.unified_msg_origin,
+            )
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".png",
+                dir=str(self.data_dir),
+            ) as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
+            self._schedule_delayed_unlink(tmp_path, 30)
+            yield event.image_result(tmp_path)
+        except Exception as e:
+            logger.error(f"[steam-monitor] test achievement render failed: {e}", exc_info=True)
+            yield event.plain_result(f"成就图片渲染失败: {e}")
+
+    @filter.command("steam test_game_start_render")
+    async def steam_test_game_start_render(
+        self,
+        event: AstrMessageEvent,
+        steamid: str,
+        gameid: int,
+    ):
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+
+        gid = str(gameid)
+        try:
+            players = await self._fetch_players([steamid])
+            player = players[0] if players else {}
+            player_name = str(player.get("personaname") or steamid)
+            avatar_url = str(
+                player.get("avatarfull") or player.get("avatarmedium") or player.get("avatar") or ""
+            )
+
+            zh_game_name, en_game_name = await self._get_game_names(gid, fallback_name=gid)
+            online_count = await self._get_game_online_count(gid)
+            font_path = str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
+            if not Path(font_path).exists():
+                font_path = ""
+
+            img_bytes = await render_game_start(
+                str(self.data_dir),
+                steamid,
+                player_name,
+                avatar_url,
+                gid,
+                zh_game_name,
+                api_key=str(self.config.get("steam_api_key", "")).strip(),
+                superpower=None,
+                sgdb_api_key=self.SGDB_API_KEY,
+                font_path=font_path,
+                sgdb_game_name=en_game_name,
+                online_count=online_count,
+                appid=gid,
+                sgdb_api_base=self.SGDB_API_BASE,
+                steam_api_base=self.STEAM_API_BASE,
+            )
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".png",
+                dir=str(self.data_dir),
+            ) as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
+            self._schedule_delayed_unlink(tmp_path, 30)
+            yield event.image_result(tmp_path)
+        except Exception as e:
+            logger.error(f"[steam-monitor] test game start render failed: {e}", exc_info=True)
+            yield event.plain_result(f"开始游戏图片渲染失败: {e}")
+
+    @filter.command("sfm_achievement_on")
+    async def achievement_on(self, event: AstrMessageEvent):
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+        await self._update_config_atomic("enable_achievement_monitor", True)
+        yield event.plain_result("已开启成就监控")
+
+    @filter.command("sfm_achievement_off")
+    async def achievement_off(self, event: AstrMessageEvent):
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+        await self._update_config_atomic("enable_achievement_monitor", False)
+        for t in list(self.achievement_poll_tasks.values()):
+            t.cancel()
+        self.achievement_poll_tasks.clear()
+        for t in list(self.achievement_final_tasks.values()):
+            t.cancel()
+        self.achievement_final_tasks.clear()
+        self.achievement_snapshots.clear()
+        yield event.plain_result("已关闭成就监控，并停止当前成就轮询任务")
+
+    @filter.command("sfm_achievement_status")
+    async def achievement_status(self, event: AstrMessageEvent):
+        if not self._is_authorized(event):
+            yield event.plain_result("无权限执行该命令")
+            return
+        lines = [
+            f"enable_achievement_monitor={self._achievement_enabled()}",
+            f"achievement_poll_interval_sec={self._achievement_poll_interval_sec()}",
+            f"achievement_final_check_delay_sec={self._achievement_final_delay_sec()}",
+            f"max_achievement_notifications={self._achievement_max_notify()}",
+            f"active_achievement_poll_tasks={len(self.achievement_poll_tasks)}",
+            f"active_achievement_final_tasks={len(self.achievement_final_tasks)}",
+            f"achievement_blacklist_size={len(self.achievement_monitor.achievement_blacklist)}",
+        ]
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("sfm_set_group_ids")
     async def set_group_ids(self, event: AstrMessageEvent, ids: str):
