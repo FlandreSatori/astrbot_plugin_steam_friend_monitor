@@ -3,7 +3,9 @@ import io
 import time
 import httpx
 from PIL import Image, ImageDraw, ImageFont
-import random
+from urllib.parse import quote
+
+from astrbot.api import logger
 
 BG_COLOR_TOP = (49, 80, 66)
 BG_COLOR_BOTTOM = (28, 35, 44)
@@ -12,9 +14,57 @@ COVER_W, COVER_H = 80, 120
 IMG_W, IMG_H = 512, 192  # 16:6，画布高度减少三分之一
 # 星星素材路径
 STAR_BG_PATH = os.path.join(os.path.dirname(__file__), "star_767x809.png")
+MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
 
 
-def get_avatar_path(data_dir, steamid, url, force_update=False):
+def _safe_json(resp: httpx.Response) -> dict:
+    try:
+        data = resp.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _download_binary(
+    client: httpx.AsyncClient,
+    url: str,
+    max_bytes: int = MAX_DOWNLOAD_BYTES,
+    expect_image: bool = True,
+) -> bytes | None:
+    try:
+        async with client.stream("GET", url) as resp:
+            if resp.status_code != 200:
+                return None
+            content_type = str(resp.headers.get("content-type", "")).lower()
+            if expect_image and content_type and not content_type.startswith("image/"):
+                logger.warning(
+                    f"[steam-monitor] non-image response while downloading: url={url} content-type={content_type}"
+                )
+                return None
+            content_length = int(resp.headers.get("content-length", "0") or 0)
+            if content_length > max_bytes:
+                logger.warning(
+                    f"[steam-monitor] download too large by header: url={url} size={content_length}"
+                )
+                return None
+
+            buf = bytearray()
+            async for chunk in resp.aiter_bytes():
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    logger.warning(
+                        f"[steam-monitor] download exceeded limit while reading: url={url}"
+                    )
+                    return None
+            return bytes(buf) if buf else None
+    except Exception as e:
+        logger.debug(f"[steam-monitor] download failed: url={url} err={e}")
+        return None
+
+
+async def get_avatar_path(data_dir, steamid, url, client: httpx.AsyncClient, force_update=False):
     avatar_dir = os.path.join(data_dir, "avatars")
     os.makedirs(avatar_dir, exist_ok=True)
     path = os.path.join(avatar_dir, f"{steamid}.jpg")
@@ -22,14 +72,16 @@ def get_avatar_path(data_dir, steamid, url, force_update=False):
     if os.path.exists(path) and not force_update:
         if time.time() - os.path.getmtime(path) < refresh_interval:
             return path
+    if not url:
+        return path if os.path.exists(path) else None
     try:
-        resp = httpx.get(url, timeout=10)
-        if resp.status_code == 200:
+        raw = await _download_binary(client, url)
+        if raw:
             with open(path, "wb") as f:
-                f.write(resp.content)
+                f.write(raw)
             return path
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"[steam-monitor] avatar download failed steamid={steamid}: {e}")
     return path if os.path.exists(path) else None
 
 
@@ -39,119 +91,65 @@ async def get_sgdb_vertical_cover(
     sgdb_game_name=None,
     appid=None,
     sgdb_api_base=None,
+    client: httpx.AsyncClient | None = None,
 ):
-    import httpx
-
     if not sgdb_api_key:
         return None
     headers = {"Authorization": f"Bearer {sgdb_api_key}"}
     sgdb_api_base = (sgdb_api_base or "https://www.steamgriddb.com").rstrip("/")
-    search_name = sgdb_game_name if sgdb_game_name else game_name
-    search_url = f"{sgdb_api_base}/api/v2/search/autocomplete/{search_name}"
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            resp = await client.get(search_url, headers=headers)
-            data = resp.json()
-            if not data.get("success") or not data.get("data"):
-                # 兜底：用 appid 查询 SGDB 游戏名
-                if appid:
-                    print(f"[SGDB兜底] appid={appid}，尝试通过appid查SGDB name")
-                    game_url = f"{sgdb_api_base}/api/v2/games/steam/{appid}"
-                    resp_game = await client.get(game_url, headers=headers)
-                    data_game = resp_game.json()
-                    if (
-                        data_game.get("success")
-                        and data_game.get("data")
-                        and data_game["data"].get("name")
-                    ):
-                        sgdb_name = data_game["data"]["name"]
-                        print(
-                            f"[SGDB兜底] appid={appid}，查到SGDB name={sgdb_name}，再次尝试查封面"
-                        )
-                        search_url2 = (
-                            f"{sgdb_api_base}/api/v2/search/autocomplete/{sgdb_name}"
-                        )
-                        resp2 = await client.get(search_url2, headers=headers)
-                        data2 = resp2.json()
-                        if data2.get("success") and data2.get("data"):
-                            sgdb_game_id = data2["data"][0]["id"]
-                            grid_url = (
-                                f"{sgdb_api_base}/api/v2/grids/game/{sgdb_game_id}"
-                                "?dimensions=600x900&type=static&limit=1"
-                            )
-                            resp3 = await client.get(grid_url, headers=headers)
-                            data3 = resp3.json()
-                            if data3.get("success") and data3.get("data"):
-                                print(
-                                    f"[SGDB兜底] 成功获取到封面: {data3['data'][0]['url']}"
-                                )
-                                return data3["data"][0]["url"]
-                        print(f"[SGDB兜底] 通过SGDB name未查到封面: {sgdb_name}")
-                print(f"[SGDB兜底] 兜底流程未查到封面 appid={appid}")
-                return None
-            sgdb_game_id = data["data"][0]["id"]
-            grid_url = (
-                f"{sgdb_api_base}/api/v2/grids/game/{sgdb_game_id}"
-                "?dimensions=600x900&type=static&limit=1"
-            )
-            resp2 = await client.get(grid_url, headers=headers)
-            data2 = resp2.json()
-            if not data2.get("success") or not data2.get("data"):
-                print(f"[SGDB主查] 查到游戏但未查到封面 sgdb_game_id={sgdb_game_id}")
-                # 主查查不到封面时也兜底
-                if appid:
-                    print(f"[SGDB主查兜底] appid={appid}，尝试通过appid查SGDB name")
-                    game_url = f"{sgdb_api_base}/api/v2/games/steam/{appid}"
-                    resp_game = await client.get(game_url, headers=headers)
-                    data_game = resp_game.json()
-                    if (
-                        data_game.get("success")
-                        and data_game.get("data")
-                        and data_game["data"].get("name")
-                    ):
-                        sgdb_name = data_game["data"]["name"]
-                        print(
-                            f"[SGDB主查兜底] appid={appid}，查到SGDB name={sgdb_name}，再次尝试查封面"
-                        )
-                        search_url2 = (
-                            f"{sgdb_api_base}/api/v2/search/autocomplete/{sgdb_name}"
-                        )
-                        resp2 = await client.get(search_url2, headers=headers)
-                        data2 = resp2.json()
-                        if data2.get("success") and data2.get("data"):
-                            sgdb_game_id = data2["data"][0]["id"]
-                            grid_url = (
-                                f"{sgdb_api_base}/api/v2/grids/game/{sgdb_game_id}"
-                                "?dimensions=600x900&type=static&limit=1"
-                            )
-                            resp3 = await client.get(grid_url, headers=headers)
-                            data3 = resp3.json()
-                            if data3.get("success") and data3.get("data"):
-                                print(
-                                    f"[SGDB主查兜底] 成功获取到封面: {data3['data'][0]['url']}"
-                                )
-                                return data3["data"][0]["url"]
-                        print(f"[SGDB主查兜底] 通过SGDB name未查到封面: {sgdb_name}")
-                print(f"[SGDB主查兜底] 兜底流程未查到封面 appid={appid}")
-                return None
-            if data2.get("success") and data2.get("data"):
-                # 遍历前3个封面，优先选静态
-                for idx, grid in enumerate(data2["data"][:3]):
-                    grid_type = grid.get("type")
-                    grid_url = grid.get("url")
-                    print(f"[SGDB遍历] idx={idx} type={grid_type} url={grid_url}")
-                    if grid_type == "static":
-                        print(f"[SGDB遍历] 选中静态封面: {grid_url}")
-                        return grid_url
-                # 如果没有静态，返回第一个可用封面
-                if data2["data"]:
-                    print(f"[SGDB遍历] 未找到静态，返回第一个封面: {data2['data'][0]['url']}")
-                    return data2["data"][0]["url"]
-            print(f"[SGDB主查] 成功获取到封面: {data2['data'][0]['url']}")
-            return data2["data"][0]["url"]
-        except Exception as e:
-            print(f"[get_sgdb_vertical_cover] SGDB API异常: {e}")
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=10, follow_redirects=True)
+
+    async def _query_cover_by_name(name: str) -> str | None:
+        encoded = quote(str(name or "").strip(), safe="")
+        if not encoded:
             return None
+        search_url = f"{sgdb_api_base}/api/v2/search/autocomplete/{encoded}"
+        resp = await client.get(search_url, headers=headers)
+        data = _safe_json(resp)
+        if not data.get("success") or not data.get("data"):
+            return None
+        sgdb_game_id = data["data"][0].get("id")
+        if not sgdb_game_id:
+            return None
+        grid_url = (
+            f"{sgdb_api_base}/api/v2/grids/game/{sgdb_game_id}"
+            "?dimensions=600x900&type=static&limit=3"
+        )
+        resp2 = await client.get(grid_url, headers=headers)
+        data2 = _safe_json(resp2)
+        grids = data2.get("data") if isinstance(data2.get("data"), list) else []
+        if not grids:
+            return None
+        for grid in grids[:3]:
+            if isinstance(grid, dict) and grid.get("type") == "static" and grid.get("url"):
+                return str(grid["url"])
+        first = grids[0]
+        if isinstance(first, dict) and first.get("url"):
+            return str(first["url"])
+        return None
+
+    try:
+        search_name = sgdb_game_name if sgdb_game_name else game_name
+        cover_url = await _query_cover_by_name(str(search_name or ""))
+        if cover_url:
+            return cover_url
+
+        if appid:
+            game_url = f"{sgdb_api_base}/api/v2/games/steam/{appid}"
+            resp_game = await client.get(game_url, headers=headers)
+            data_game = _safe_json(resp_game)
+            sgdb_name = str((data_game.get("data") or {}).get("name") or "").strip()
+            if sgdb_name:
+                return await _query_cover_by_name(sgdb_name)
+        return None
+    except Exception as e:
+        logger.warning(f"[steam-monitor] get SGDB cover failed appid={appid}: {e}")
+        return None
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 async def get_cover_path(
@@ -163,39 +161,49 @@ async def get_cover_path(
     sgdb_game_name=None,
     appid=None,
     sgdb_api_base=None,
+    client: httpx.AsyncClient | None = None,
 ):
-    from PIL import Image as PILImage
-    import httpx
-
     cover_dir = os.path.join(data_dir, "covers_v")
     os.makedirs(cover_dir, exist_ok=True)
     path = os.path.join(cover_dir, f"{gameid}.jpg")
     # 只在本地不存在时才云端获取
     if os.path.exists(path):
         return path
+
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=10, follow_redirects=True)
+
     # 只尝试 SGDB 竖版封面
-    url = await get_sgdb_vertical_cover(
-        game_name,
-        sgdb_api_key,
-        sgdb_game_name=sgdb_game_name,
-        appid=appid,
-        sgdb_api_base=sgdb_api_base,
-    )
-    if url:
-        try:
-            resp = httpx.get(url, timeout=10)
-            if resp.status_code == 200:
-                with open(path, "wb") as f:
-                    f.write(resp.content)
-                return path
-        except Exception as e:
-            print(f"[get_cover_path] SGDB下载异常: {e} url={url}")
-    # 新增：SGDB未收录或下载失败时，使用missingcover.jpg
-    print(f"[get_cover_path] SGDB未收录或下载失败: {gameid} {game_name}，使用默认封面")
-    missing_cover = os.path.join(os.path.dirname(__file__), "missingcover.jpg")
-    if os.path.exists(missing_cover):
-        return missing_cover
-    return None
+    try:
+        url = await get_sgdb_vertical_cover(
+            game_name,
+            sgdb_api_key,
+            sgdb_game_name=sgdb_game_name,
+            appid=appid,
+            sgdb_api_base=sgdb_api_base,
+            client=client,
+        )
+        if url and client is not None:
+            try:
+                raw = await _download_binary(client, url)
+                if raw:
+                    with open(path, "wb") as f:
+                        f.write(raw)
+                    return path
+            except Exception as e:
+                logger.warning(f"[steam-monitor] SGDB cover download failed gameid={gameid}: {e}")
+
+        logger.info(
+            f"[steam-monitor] SGDB cover missing, fallback to local default gameid={gameid} game_name={game_name}"
+        )
+        missing_cover = os.path.join(os.path.dirname(__file__), "missingcover.jpg")
+        if os.path.exists(missing_cover):
+            return missing_cover
+        return None
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 def text_wrap(text, font, max_width):
@@ -245,7 +253,14 @@ def render_gradient_bg(img_w, img_h, color_top, color_bottom):
     return base
 
 
-async def get_playtime_hours(api_key, steamid, appid, retry_times=3, steam_api_base=None):
+async def get_playtime_hours(
+    api_key,
+    steamid,
+    appid,
+    retry_times=3,
+    steam_api_base=None,
+    client: httpx.AsyncClient | None = None,
+):
     """通过 Steam Web API 获取某玩家某游戏的总游玩小时数（异步实现，失败自动重试）"""
     import asyncio
 
@@ -254,28 +269,35 @@ async def get_playtime_hours(api_key, steamid, appid, retry_times=3, steam_api_b
         f"{steam_api_base}/IPlayerService/GetOwnedGames/v1/"
         f"?key={api_key}&steamid={steamid}&include_appinfo=0&appids_filter[0]={appid}"
     )
-    for attempt in range(retry_times):
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=10, follow_redirects=True)
+    try:
+        for attempt in range(retry_times):
+            try:
                 resp = await client.get(url)
                 if resp.status_code == 200:
-                    data = resp.json()
-                    print(f"[get_playtime_hours] API返回: {data}")
+                    data = _safe_json(resp)
                     games = data.get("response", {}).get("games", [])
                     for g in games:
                         if str(g.get("appid")) == str(appid):
                             playtime_min = g.get("playtime_forever", 0)
                             return round(playtime_min / 60, 1)
-                    print(
-                        f"[get_playtime_hours] 未找到目标游戏: steamid={steamid} appid={appid} games={games}"
+                    logger.debug(
+                        f"[steam-monitor] playtime game not found steamid={steamid} appid={appid}"
                     )
                 else:
-                    print(f"[get_playtime_hours] HTTP状态码异常: {resp.status_code} url={url}")
-        except Exception as e:
-            print(f"[get_playtime_hours] 获取游玩时间异常: {e} url={url}")
-        if attempt < retry_times - 1:
-            await asyncio.sleep(1)
-    return 0.0
+                    logger.debug(
+                        f"[steam-monitor] playtime request status={resp.status_code} steamid={steamid} appid={appid}"
+                    )
+            except Exception as e:
+                logger.warning(f"[steam-monitor] get playtime failed appid={appid}: {e}")
+            if attempt < retry_times - 1:
+                await asyncio.sleep(1)
+        return 0.0
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 def get_font_path(font_name):
@@ -303,12 +325,26 @@ def render_game_start_image(
 ):
     # 字体
     fonts_dir = os.path.join(os.path.dirname(__file__), "fonts")
-    font_regular = os.path.join(fonts_dir, "NotoSansHans-Regular.otf")
-    font_medium = os.path.join(fonts_dir, "NotoSansHans-Medium.otf")
-    if not os.path.exists(font_regular):
-        font_regular = os.path.join(os.path.dirname(__file__), "NotoSansHans-Regular.otf")
-    if not os.path.exists(font_medium):
-        font_medium = os.path.join(os.path.dirname(__file__), "NotoSansHans-Medium.otf")
+    default_regular = os.path.join(fonts_dir, "NotoSansHans-Regular.otf")
+    default_medium = os.path.join(fonts_dir, "NotoSansHans-Medium.otf")
+
+    font_regular = default_regular
+    if font_path and os.path.exists(font_path):
+        font_regular = font_path
+    elif not os.path.exists(font_regular):
+        fallback_regular = os.path.join(os.path.dirname(__file__), "NotoSansHans-Regular.otf")
+        if os.path.exists(fallback_regular):
+            font_regular = fallback_regular
+
+    font_medium = default_medium
+    if "Regular" in os.path.basename(font_regular):
+        derived_medium = font_regular.replace("Regular", "Medium")
+        if os.path.exists(derived_medium):
+            font_medium = derived_medium
+    elif os.path.exists(default_medium):
+        font_medium = default_medium
+    elif os.path.exists(font_regular):
+        font_medium = font_regular
     try:
         font_bold = ImageFont.truetype(font_medium, 28)
         font = ImageFont.truetype(font_regular, 22)
@@ -336,7 +372,7 @@ def render_game_start_image(
         for x in range(0, IMG_W, new_w):
             img.alpha_composite(bg_resized, (x, 0))
     except Exception as e:
-        print(f"[render_game_start_image] 背景图片加载失败 (bg_path={bg_path}): {e}")
+        logger.warning(f"[steam-monitor] background image load failed bg_path={bg_path}: {e}")
 
     # 2. 封面图贴左，等比例缩放高度，宽度自适应，左贴右留空，不裁剪
     cover_area_h = IMG_H
@@ -350,7 +386,7 @@ def render_game_start_image(
             cover_resized = cover_src.resize((new_w, new_h), Image.LANCZOS)
             img.paste(cover_resized, (0, 0), cover_resized)
         except Exception as e:
-            print(f"[render_game_start_image] 封面渲染失败: {e}")
+            logger.warning(f"[steam-monitor] cover render failed: {e}")
             new_w = COVER_W  # 渲染失败时使用默认宽度
 
     # 3. 头像位置参数（不再渲染头像）
@@ -421,7 +457,7 @@ def render_game_start_image(
             avatar_rgba.putalpha(mask)
             img.alpha_composite(avatar_rgba, (avatar_x, avatar_y))
         except Exception as e:
-            print(f"[render_game_start_image] 头像渲染失败: {e}")
+            logger.warning(f"[steam-monitor] avatar render failed: {e}")
     # 新增：右上角显示在线人数
     online_text = None
     if online_count is not None:
@@ -458,9 +494,8 @@ def render_game_start_image(
         playtime_str = f"游戏时间 {playtime_hours} 小时"
         y_time = text_y + line_height * 3 + 4  # 游戏名下一行
         draw.text((text_x + 8, y_time), playtime_str, font=font_small, fill=(120, 180, 255, 255))
-        print(f"[render_game_start_image] 渲染游戏时长: {playtime_str}")
     else:
-        print("[render_game_start_image] 未获取到游戏时长，playtime_hours=None")
+        logger.debug("[steam-monitor] playtime unavailable while rendering game start image")
 
     # 在线人数渲染（右上角）
     if online_text:
@@ -490,20 +525,28 @@ async def render_game_start(
     bg_image_path=None,
     bg_opacity=0.15,
 ):
-    print(f"[render_game_start] superpower参数: {superpower}")
-    avatar_path = get_avatar_path(data_dir, steamid, avatar_url)
-    cover_path = await get_cover_path(
-        data_dir,
-        gameid,
-        game_name,
-        sgdb_api_key=sgdb_api_key,
-        sgdb_game_name=sgdb_game_name,
-        appid=appid,
-        sgdb_api_base=sgdb_api_base,
-    )
-    playtime_hours = None
-    if api_key:
-        playtime_hours = await get_playtime_hours(api_key, steamid, gameid, steam_api_base=steam_api_base)
+    logger.debug(f"[steam-monitor] render_game_start superpower={superpower}")
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        avatar_path = await get_avatar_path(data_dir, steamid, avatar_url, client=client)
+        cover_path = await get_cover_path(
+            data_dir,
+            gameid,
+            game_name,
+            sgdb_api_key=sgdb_api_key,
+            sgdb_game_name=sgdb_game_name,
+            appid=appid,
+            sgdb_api_base=sgdb_api_base,
+            client=client,
+        )
+        playtime_hours = None
+        if api_key:
+            playtime_hours = await get_playtime_hours(
+                api_key,
+                steamid,
+                gameid,
+                steam_api_base=steam_api_base,
+                client=client,
+            )
     img = render_game_start_image(
         player_name,
         avatar_path,

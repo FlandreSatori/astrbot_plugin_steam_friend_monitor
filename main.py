@@ -30,9 +30,6 @@ import astrbot.api.message_components as Comp
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
-STEAM_SUMMARY_API = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
-
-
 def parse_ids(raw: str) -> List[str]:
     text = (raw or "").replace(chr(10), ",")
     return [x.strip() for x in text.split(",") if x.strip()]
@@ -240,7 +237,7 @@ class SteamFriendMonitor(Star):
             "[steam-monitor] image cfg: "
             f"image_proxy_prefix={self.config.get('image_proxy_prefix', 'https://images.weserv.nl/?url=')} "
             f"strict_remote_host={self.config.get('strict_remote_host', False)} "
-            f"allow_dns_private_for_allow_domains={self.config.get('allow_dns_private_for_allow_domains', True)} "
+            f"allow_dns_private_for_allow_domains={self.config.get('allow_dns_private_for_allow_domains', False)} "
             f"remote_host_allowlist={self.config.get('remote_host_allowlist', '')} "
             f"max_redirects={self.config.get('max_redirects', 3)} "
             f"max_image_bytes={self.config.get('max_image_bytes', 3 * 1024 * 1024)}"
@@ -265,6 +262,8 @@ class SteamFriendMonitor(Star):
             t.cancel()
         self.achievement_final_tasks.clear()
         self.achievement_snapshots.clear()
+        with contextlib.suppress(Exception):
+            await self.achievement_monitor.aclose()
 
         if self.http:
             await self.http.aclose()
@@ -687,7 +686,8 @@ class SteamFriendMonitor(Star):
                         game_name,
                         new_achievements,
                     )
-                # 不在周期检查中更新快照，快照只在游戏开始时记录，确保最终检查与开始时比对
+                # 更新快照，避免同一批新成就在后续周期中重复推送
+                self.achievement_snapshots[key] = list(current)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -1073,7 +1073,8 @@ class SteamFriendMonitor(Star):
             
             for attempt in range(max_retries + 1):
                 try:
-                    r = await self.http.get(STEAM_SUMMARY_API, params=params)
+                    summary_api = f"{self.STEAM_API_BASE}/ISteamUser/GetPlayerSummaries/v2/"
+                    r = await self.http.get(summary_api, params=params)
                     r.raise_for_status()
                     data = r.json()
                     players.extend(data.get("response", {}).get("players", []))
@@ -1238,7 +1239,7 @@ class SteamFriendMonitor(Star):
 
             allow_domains = self._remote_host_allow_domains()
             bypass_dns_private = bool(
-                self.config.get("allow_dns_private_for_allow_domains", True)
+                self.config.get("allow_dns_private_for_allow_domains", False)
             )
             if bypass_dns_private and self._is_host_in_domains(host, allow_domains):
                 logger.debug(
@@ -1449,7 +1450,7 @@ class SteamFriendMonitor(Star):
             return cached
         logger.debug(f"[steam-monitor] game icon url cache miss: appid={appid}")
 
-        api = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=schinese"
+        api = f"{self.STEAM_STORE_BASE}/api/appdetails?appids={appid}&l=schinese"
         logger.debug(f"[steam-monitor] fetch game icon metadata appid={appid} api={api}")
         try:
             raw = await self._fetch_url_bytes(
@@ -2110,7 +2111,6 @@ class SteamFriendMonitor(Star):
     async def _poll_loop(self):
         await asyncio.sleep(3)
         while not self._stop:
-            image_path = None
             try:
                 # 获取全局 steam_ids 和推送目标
                 global_steam_ids = parse_ids(self.config.get("steam_ids", ""))
@@ -2168,10 +2168,6 @@ class SteamFriendMonitor(Star):
             except Exception as e:
                 logger.error(f"[steam-monitor] poll error: {e}")
                 await asyncio.sleep(30)
-            finally:
-                if image_path:
-                    with contextlib.suppress(Exception):
-                        Path(image_path).unlink(missing_ok=True)
 
     async def _poll_for_target(
         self, target: str, steam_ids: List[str], default_interval: int
@@ -2643,7 +2639,7 @@ class SteamFriendMonitor(Star):
         targets = self._get_targets()
         if umo in targets:
             targets.remove(umo)
-            self._set_targets(targets)
+            await self._update_targets_atomic(targets)
         yield event.plain_result("已取消当前会话绑定")
 
     @filter.command("sfm_targets")

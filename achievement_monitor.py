@@ -1,6 +1,8 @@
 import json
 import io
 import hashlib
+import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
@@ -31,10 +33,17 @@ class AchievementMonitor:
 
         self.initial_achievements: Dict[str, list[str]] = {}
         self.achievement_blacklist: set[str] = set()
-        self.details_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self.details_cache: OrderedDict[tuple[str, str], tuple[float, Dict[str, Any]]] = OrderedDict()
+        self.details_cache_ttl_sec = 3600
+        self.details_cache_max_items = 256
+        self.icon_max_bytes = 2 * 1024 * 1024
+        self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
 
         self._load_achievements_cache()
         self._load_blacklist()
+
+    async def aclose(self):
+        await self.http.aclose()
 
     def _make_key(self, target: str, steamid: str, appid: str) -> str:
         return json.dumps([str(target), str(steamid), str(appid)], ensure_ascii=False)
@@ -110,8 +119,7 @@ class AchievementMonitor:
             }
             for attempt in range(3):
                 try:
-                    async with httpx.AsyncClient(timeout=15) as client:
-                        resp = await client.get(url, params=params)
+                    resp = await self.http.get(url, params=params)
                     if resp.status_code == 401:
                         logger.info(
                             f"[steam-monitor] no permission to read achievements steamid={steamid} appid={appid}"
@@ -129,6 +137,9 @@ class AchievementMonitor:
                     if not isinstance(achievements, list):
                         continue
 
+                    # 只要成功拿到 achievements 列表，就视为请求成功。
+                    all_failed = False
+
                     unlocked = {
                         str(ach.get("apiname", "")).strip()
                         for ach in achievements
@@ -137,13 +148,7 @@ class AchievementMonitor:
                         and str(ach.get("apiname", "")).strip()
                     }
 
-                    has_desc = any(
-                        isinstance(ach, dict) and str(ach.get("description", "")).strip()
-                        for ach in achievements
-                    )
-                    if has_desc:
-                        all_failed = False
-                        return unlocked
+                    return unlocked
                 except Exception as e:
                     logger.debug(
                         f"[steam-monitor] get player achievements failed attempt={attempt + 1} appid={appid} lang={lang}: {e}"
@@ -170,8 +175,12 @@ class AchievementMonitor:
 
         cache_key = (str(target), appid)
         cached = self.details_cache.get(cache_key)
-        if isinstance(cached, dict) and cached:
-            return cached
+        if cached:
+            ts, payload = cached
+            if (time.time() - ts) <= self.details_cache_ttl_sec:
+                self.details_cache.move_to_end(cache_key)
+                return payload
+            self.details_cache.pop(cache_key, None)
 
         details: Dict[str, Any] = {}
         url_stats = (
@@ -181,117 +190,119 @@ class AchievementMonitor:
         lang_list = [lang, "schinese", "english", "en"]
 
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                # 先取解锁率
-                percents: Dict[str, Any] = {}
-                try:
-                    stats_resp = await client.get(url_stats)
-                    if stats_resp.status_code == 200:
-                        stats_data = stats_resp.json()
+            # 先取解锁率
+            percents: Dict[str, Any] = {}
+            try:
+                stats_resp = await self.http.get(url_stats)
+                if stats_resp.status_code == 200:
+                    stats_data = stats_resp.json()
+                    arr = (
+                        stats_data.get("achievementpercentages", {}).get("achievements", [])
+                        if isinstance(stats_data, dict)
+                        else []
+                    )
+                    if isinstance(arr, list):
+                        for ach in arr:
+                            if isinstance(ach, dict):
+                                name = str(ach.get("name", "")).strip()
+                                if name:
+                                    percents[name] = ach.get("percent")
+            except Exception as e:
+                logger.debug(f"[steam-monitor] get achievement percents failed appid={appid}: {e}")
+
+            for try_lang in lang_list:
+                schema_url = (
+                    f"{self.steam_api_base}/ISteamUserStats/GetSchemaForGame/v2/"
+                    f"?appid={appid}&key={api_key}&l={try_lang}"
+                )
+                resp = await self.http.get(schema_url)
+                if resp.status_code == 400 and api_key and steamid:
+                    # 降级为玩家成就接口，至少拿到名称
+                    p_resp = await self.http.get(
+                        f"{self.steam_api_base}/ISteamUserStats/GetPlayerAchievements/v1/",
+                        params={
+                            "key": api_key,
+                            "steamid": steamid,
+                            "appid": appid,
+                            "l": try_lang,
+                        },
+                    )
+                    if p_resp.status_code == 200:
+                        p_data = p_resp.json()
                         arr = (
-                            stats_data.get("achievementpercentages", {}).get("achievements", [])
-                            if isinstance(stats_data, dict)
+                            p_data.get("playerstats", {}).get("achievements", [])
+                            if isinstance(p_data, dict)
                             else []
                         )
                         if isinstance(arr, list):
                             for ach in arr:
-                                if isinstance(ach, dict):
-                                    name = str(ach.get("name", "")).strip()
-                                    if name:
-                                        percents[name] = ach.get("percent")
-                except Exception:
-                    pass
+                                if not isinstance(ach, dict):
+                                    continue
+                                apiname = str(ach.get("apiname", "")).strip()
+                                if not apiname:
+                                    continue
+                                details[apiname] = {
+                                    "name": ach.get("name") or apiname,
+                                    "description": ach.get("description") or "",
+                                    "icon": None,
+                                    "icon_gray": None,
+                                    "percent": percents.get(apiname),
+                                }
+                            if any(str(v.get("description", "")).strip() for v in details.values()):
+                                break
+                    continue
 
-                for try_lang in lang_list:
-                    schema_url = (
-                        f"{self.steam_api_base}/ISteamUserStats/GetSchemaForGame/v2/"
-                        f"?appid={appid}&key={api_key}&l={try_lang}"
-                    )
-                    resp = await client.get(schema_url)
-                    if resp.status_code == 400 and api_key and steamid:
-                        # 降级为玩家成就接口，至少拿到名称
-                        p_resp = await client.get(
-                            f"{self.steam_api_base}/ISteamUserStats/GetPlayerAchievements/v1/",
-                            params={
-                                "key": api_key,
-                                "steamid": steamid,
-                                "appid": appid,
-                                "l": try_lang,
-                            },
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                achievements = (
+                    data.get("game", {})
+                    .get("availableGameStats", {})
+                    .get("achievements", [])
+                    if isinstance(data, dict)
+                    else []
+                )
+                if not isinstance(achievements, list):
+                    continue
+
+                tmp_details: Dict[str, Any] = {}
+                for ach in achievements:
+                    if not isinstance(ach, dict):
+                        continue
+                    apiname = str(ach.get("name", "")).strip()
+                    if not apiname:
+                        continue
+
+                    def to_icon_url(val: Any) -> Optional[str]:
+                        sval = str(val or "").strip()
+                        if not sval:
+                            return None
+                        if sval.startswith("http://") or sval.startswith("https://"):
+                            return sval
+                        return (
+                            "https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/"
+                            f"{appid}/{sval}.jpg"
                         )
-                        if p_resp.status_code == 200:
-                            p_data = p_resp.json()
-                            arr = (
-                                p_data.get("playerstats", {}).get("achievements", [])
-                                if isinstance(p_data, dict)
-                                else []
-                            )
-                            if isinstance(arr, list):
-                                for ach in arr:
-                                    if not isinstance(ach, dict):
-                                        continue
-                                    apiname = str(ach.get("apiname", "")).strip()
-                                    if not apiname:
-                                        continue
-                                    details[apiname] = {
-                                        "name": ach.get("name") or apiname,
-                                        "description": ach.get("description") or "",
-                                        "icon": None,
-                                        "icon_gray": None,
-                                        "percent": percents.get(apiname),
-                                    }
-                                if any(str(v.get("description", "")).strip() for v in details.values()):
-                                    break
-                        continue
 
-                    if resp.status_code != 200:
-                        continue
-                    data = resp.json()
-                    achievements = (
-                        data.get("game", {})
-                        .get("availableGameStats", {})
-                        .get("achievements", [])
-                        if isinstance(data, dict)
-                        else []
-                    )
-                    if not isinstance(achievements, list):
-                        continue
-
-                    tmp_details: Dict[str, Any] = {}
-                    for ach in achievements:
-                        if not isinstance(ach, dict):
-                            continue
-                        apiname = str(ach.get("name", "")).strip()
-                        if not apiname:
-                            continue
-
-                        def to_icon_url(val: Any) -> Optional[str]:
-                            sval = str(val or "").strip()
-                            if not sval:
-                                return None
-                            if sval.startswith("http://") or sval.startswith("https://"):
-                                return sval
-                            return (
-                                "https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/"
-                                f"{appid}/{sval}.jpg"
-                            )
-
-                        tmp_details[apiname] = {
-                            "name": ach.get("displayName") or apiname,
-                            "description": ach.get("description") or "",
-                            "icon": to_icon_url(ach.get("icon")),
-                            "icon_gray": to_icon_url(ach.get("icongray")),
-                            "percent": percents.get(apiname),
-                        }
-                    if tmp_details:
-                        details = tmp_details
-                    if any(str(v.get("description", "")).strip() for v in details.values()):
-                        break
+                    tmp_details[apiname] = {
+                        "name": ach.get("displayName") or apiname,
+                        "description": ach.get("description") or "",
+                        "icon": to_icon_url(ach.get("icon")),
+                        "icon_gray": to_icon_url(ach.get("icongray")),
+                        "percent": percents.get(apiname),
+                    }
+                if tmp_details:
+                    details = tmp_details
+                if any(str(v.get("description", "")).strip() for v in details.values()):
+                    break
         except Exception as e:
             logger.warning(f"[steam-monitor] get achievement details failed appid={appid}: {e}")
 
         if details:
-            self.details_cache[cache_key] = details
+            self.details_cache[cache_key] = (time.time(), details)
+            self.details_cache.move_to_end(cache_key)
+            while len(self.details_cache) > self.details_cache_max_items:
+                self.details_cache.popitem(last=False)
         return details
 
     def clear_game_achievements(self, target: str, steamid: str, appid: str):
@@ -347,7 +358,31 @@ class AchievementMonitor:
             try:
                 async with session.get(icon_url) as response:
                     if response.status == 200:
-                        raw = await response.read()
+                        content_type = str(response.headers.get("Content-Type", "")).lower()
+                        if content_type and not content_type.startswith("image/"):
+                            logger.warning(
+                                f"[steam-monitor] skip non-image icon content-type={content_type} url={icon_url}"
+                            )
+                            return None
+
+                        content_length = int(response.headers.get("Content-Length", "0") or 0)
+                        if content_length > self.icon_max_bytes:
+                            logger.warning(
+                                f"[steam-monitor] icon too large by header size={content_length} url={icon_url}"
+                            )
+                            return None
+
+                        buf = bytearray()
+                        async for chunk in response.content.iter_chunked(65536):
+                            if not chunk:
+                                continue
+                            buf.extend(chunk)
+                            if len(buf) > self.icon_max_bytes:
+                                logger.warning(
+                                    f"[steam-monitor] icon too large while reading url={icon_url}"
+                                )
+                                return None
+                        raw = bytes(buf)
                         if raw:
                             try:
                                 cache_path.write_bytes(raw)

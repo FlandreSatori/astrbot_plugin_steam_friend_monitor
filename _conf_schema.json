@@ -118,7 +118,7 @@
   "allow_dns_private_for_allow_domains": {
     "description": "允许对白名单域名跳过内网解析拦截",
     "type": "bool",
-    "default": true,
+    "default": false,
     "hint": "用于修复部分网络环境下 Steam 域名被 DNS污染/代理 为私网地址导致的误拦截；关闭后将恢复严格拦截"
   },
   "game_start_bg_image": {
