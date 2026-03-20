@@ -2482,7 +2482,11 @@ class SteamFriendMonitor(Star):
                         str(p.get("avatarfull") or p.get("avatarmedium") or p.get("avatar") or "")
                     )
                     if not prev_game and game:
-                        events.append(f"{name} 启动《{game}》")
+                        # 判断玩家名和游戏名是否超过20个字符
+                        if len(name) + len(game) > 20:
+                            events.append(f"{name} 启动\n《{game}》")
+                        else:
+                            events.append(f"{name} 启动《{game}》")
                         event_types.add("game_start")
                         if current_gameid:
                             self._spawn_bg_task(
@@ -2500,16 +2504,26 @@ class SteamFriendMonitor(Star):
                             prev_game_accum_seconds
                             + self._session_seconds_total(prev_game_start_ts, now_dt)
                         )
-                        events.append(f"{name} 结束《{prev_game}》 {game_duration}")
+                        # 判断玩家名和游戏名是否超过20个字符
+                        if len(name) + len(prev_game) > 20:
+                            events.append(f"{name}  结束\n《{prev_game}》 {game_duration}")
+                        else:
+                            events.append(f"{name}  结束《{prev_game}》 {game_duration}")
                         event_types.add("game_stop")
                     elif prev_game and game and prev_game != game:
                         game_duration = self._format_game_duration(
                             prev_game_accum_seconds
                             + self._session_seconds_total(prev_game_start_ts, now_dt)
                         )
-                        events.append(
-                            f"{name} 切换游戏《{prev_game}》 -> 《{game}》 {game_duration}"
-                        )
+                        # 判断旧游戏名和游戏名是否超过20个字符（对于切换游戏，检查新游戏名）
+                        if len(prev_game) + len(game) > 20:
+                            events.append(
+                                f"{name} 切换游戏\n《{prev_game}》 -> \n《{game}》 {game_duration}"
+                            )
+                        else:
+                            events.append(
+                                f"{name} 切换游戏\n《{prev_game}》 -> 《{game}》 {game_duration}"
+                            )
                         event_types.add("game_switch")
                         if current_gameid:
                             self._spawn_bg_task(
