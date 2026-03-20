@@ -19,17 +19,17 @@
   "poll_interval_sec": {
     "description": "基础轮询间隔（秒）",
     "type": "int",
-    "default": 60
+    "default": 50
   },
   "status_image_min_interval_min": {
     "description": "状态图片推送最小间隔（分钟，0 表示不限制）",
     "type": "int",
-    "default": 0
+    "default": 3
   },
   "presence_flap_suppress_min": {
     "description": "上下线抖动抑制窗口（分钟，窗口内重复上下线不播报）",
     "type": "int",
-    "default": 3,
+    "default": 2,
     "hint": "用于过滤网络波动导致的短暂上下线；窗口内离线后恢复同一游戏会延续时长"
   },
   "count_game_duration_online_only": {
@@ -41,13 +41,13 @@
   "status_text_trigger_types": {
     "description": "触发状态文字推送的事件类型（逗号分隔，可多选或留空）",
     "type": "string",
-    "default": "online,offline,game_start,game_stop,game_switch",
+    "default": "online,game_stop,game_switch",
     "hint": "可选值：online,offline,game_start,game_stop,game_switch；留空表示不因事件自动推送状态文字"
   },
   "status_image_trigger_types": {
     "description": "触发状态图片推送的事件类型（逗号分隔，可多选或留空）",
     "type": "string",
-    "default": "online,offline,game_start,game_stop,game_switch",
+    "default": "",
     "hint": "可选值：online,offline,game_start,game_stop,game_switch；留空表示不因事件自动推送状态图片"
   },
   "enable_achievement_monitor": {
