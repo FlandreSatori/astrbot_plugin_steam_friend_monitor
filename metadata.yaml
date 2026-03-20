@@ -1,6 +1,6 @@
 name: astrbot_plugin_steam_friend_monitor
 display_name: Steam 好友在线监控
 desc: "看看谁在偷偷玩游戏！\n支持上线/下线/启动游戏/切换游戏 多选触发图片推送，支持成就播报。"
-version: 0.8.1
+version: 0.8.2
 author: FlandreSatori
 repo: https://github.com/FlandreSatori/astrbot_plugin_steam_friend_monitor

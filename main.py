@@ -841,6 +841,19 @@ class SteamFriendMonitor(Star):
         default = self.local_config_defaults.get("enable_game_start_render", True)
         return bool(self.config.get("enable_game_start_render", default))
 
+    def _non_steam_game_start_text_exception_enabled(self) -> bool:
+        default = self.local_config_defaults.get(
+            "enable_non_steam_game_start_text_exception", False
+        )
+        return bool(
+            self.config.get("enable_non_steam_game_start_text_exception", default)
+        )
+
+    def _is_non_steam_game_start(self, game_name: str) -> bool:
+        game_name = (game_name or "").strip()
+        # 基于 profile 回退文本判定非 Steam 启动，不依赖 gameid。
+        return game_name in {"非 Steam 游戏中", "非 Steam 游戏"}
+
     async def _get_game_names(
         self, gameid: str, fallback_name: str | None = None
     ) -> tuple[str, str]:
@@ -2182,6 +2195,7 @@ class SteamFriendMonitor(Star):
 
             events: List[str] = []
             event_types: set[str] = set()
+            has_non_steam_game_start = False
             now_dt = datetime.now()
             now = now_dt.isoformat(timespec="seconds")
             cycle_key = self._daily_cycle_key_utc8(now_dt)
@@ -2484,6 +2498,8 @@ class SteamFriendMonitor(Star):
                         else:
                             events.append(f"{name} 启动《{game}》")
                         event_types.add("game_start")
+                        if self._is_non_steam_game_start(game):
+                            has_non_steam_game_start = True
                         if current_gameid:
                             self._spawn_bg_task(
                                 self._push_game_start_render(
@@ -2561,6 +2577,15 @@ class SteamFriendMonitor(Star):
                 image_trigger_types = self._status_image_trigger_types()
                 send_text = bool(event_types & text_trigger_types)
                 send_image = bool(event_types & image_trigger_types)
+
+                # 例外：即使关闭了 game_start 文字触发，也允许非 Steam 游戏启动时推送文字。
+                if (
+                    not send_text
+                    and "game_start" not in text_trigger_types
+                    and has_non_steam_game_start
+                    and self._non_steam_game_start_text_exception_enabled()
+                ):
+                    send_text = True
 
                 if not send_text and not send_image:
                     logger.debug(

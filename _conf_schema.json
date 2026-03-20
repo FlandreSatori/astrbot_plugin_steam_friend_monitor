@@ -83,6 +83,12 @@
     "type": "bool",
     "default": true
   },
+  "enable_non_steam_game_start_text_exception": {
+    "description": "为非 Steam 游戏启动添加文字推送例外",
+    "type": "bool",
+    "default": false,
+    "hint": "当 status_text_trigger_types 未包含 game_start 时，开启后仍会在检测到非 Steam 游戏启动时推送文字"
+  },
   "steam_api_base": {
     "description": "Steam API 基础地址",
     "type": "string",
