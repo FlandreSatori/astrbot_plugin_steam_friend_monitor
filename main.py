@@ -1672,7 +1672,7 @@ class SteamFriendMonitor(Star):
                 filled += 1
 
         if attempted:
-            logger.info(
+            logger.debug(
                 f"[steam-monitor] profile fallback enrichment attempted={attempted} filled={filled}"
             )
         return players
@@ -2145,7 +2145,7 @@ class SteamFriendMonitor(Star):
                 next_sleep = self._compute_next_interval(
                     global_steam_ids, default_interval
                 )
-                logger.info(f"[steam-monitor] next poll in {next_sleep}s")
+                logger.debug(f"[steam-monitor] next poll in {next_sleep}s")
                 await asyncio.sleep(next_sleep)
             except asyncio.CancelledError:
                 break
