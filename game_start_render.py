@@ -371,38 +371,8 @@ def render_game_start_image(
             avatar_rgba = avatar.copy()
             avatar_rgba.putalpha(mask)
             img.alpha_composite(avatar_rgba, (avatar_x, avatar_y))
-            # 超能力文本渲染（头像下方居中两行）
-            if superpower:
-                try:
-                    font_power_title = ImageFont.truetype(font_regular, 16)
-                    font_power = ImageFont.truetype(font_regular, 18)
-                except Exception:
-                    font_power_title = font_power = ImageFont.load_default()
-                power_y = avatar_y + AVATAR_SIZE + 8
-                title_text = "今天的超能力"
-                ability_text = superpower
-                title_bbox = draw.textbbox((0, 0), title_text, font=font_power_title)
-                title_w = title_bbox[2] - title_bbox[0]
-                title_h = title_bbox[3] - title_bbox[1]
-                ability_bbox = draw.textbbox((0, 0), ability_text, font=font_power)
-                ability_w = ability_bbox[2] - ability_bbox[0]
-                title_color = (255, 255, 255, 128)
-                ability_color = (120, 180, 255, 128)
-                draw.text(
-                    (avatar_x + (AVATAR_SIZE - title_w) // 2, power_y),
-                    title_text,
-                    font=font_power_title,
-                    fill=title_color,
-                )
-                draw.text(
-                    (avatar_x + (AVATAR_SIZE - ability_w) // 2, power_y + title_h + 2),
-                    ability_text,
-                    font=font_power,
-                    fill=ability_color,
-                )
         except Exception as e:
-            print(f"[render_game_start_image] 头像/超能力渲染失败: {e}")
-
+            print(f"[render_game_start_image] 头像渲染失败: {e}")
     # 新增：右上角显示在线人数，提前计算宽度
     online_text = None
     online_text_w = 0
@@ -411,7 +381,7 @@ def render_game_start_image(
             font_online = ImageFont.truetype(font_regular, 14)
         except Exception:
             font_online = ImageFont.load_default()
-        online_text = f"     \u25CF玩家人数{online_count}"
+        online_text = f"●玩家人数{online_count}"
         text_bbox = draw.textbbox((0, 0), online_text, font=font_online)
         online_text_w = text_bbox[2] - text_bbox[0] + 10  # 加右侧边距
 
@@ -436,13 +406,12 @@ def render_game_start_image(
     # “正在玩”
     draw.text((text_x + 8, text_y + line_height), "正在玩", font=font, fill=(200, 255, 200, 255))
     # 游戏名多行（亮绿色 129,173,81）
-    game_base_y = text_y + line_height * 2
     for idx, line in enumerate(game_name_lines):
-        draw.text((text_x + 8, game_base_y + idx * line_height), line, font=font, fill=(129, 173, 81, 255))
+        draw.text((text_x + 8, text_y + line_height * 2 + idx * line_height), line, font=font, fill=(129, 173, 81, 255))
     # 游戏时长（紧跟在最后一行游戏名下方，无多余空行）
     if playtime_hours is not None:
         playtime_str = f"游戏时间 {playtime_hours} 小时"
-        y_time = game_base_y + len(game_name_lines) * line_height + 4  # 仅加4像素间距
+        y_time = text_y + line_height * 2 + len(game_name_lines) * line_height + 4  # 仅加4像素间距
         draw.text((text_x + 8, y_time), playtime_str, font=font_small, fill=(120, 180, 255, 255))
         print(f"[render_game_start_image] 渲染游戏时长: {playtime_str}")
     else:
