@@ -582,7 +582,14 @@ class SteamFriendMonitor(Star):
                 sid,
                 gameid,
             )
-            self.achievement_snapshots[key] = list(achievements) if achievements else []
+            achievements_list = list(achievements) if achievements else []
+            # 保存游戏开始时的成就快照到内存和持久化缓存（后续用于判断新成就）
+            self.achievement_snapshots[key] = achievements_list
+            # 保存到持久化缓存，以便插件重启后仍能判断重复
+            cache_key = self.achievement_monitor._make_key(target, sid, gameid)
+            self.achievement_monitor.initial_achievements[cache_key] = achievements_list
+            self.achievement_monitor._save_achievements_cache()
+            
             poll_task = asyncio.create_task(
                 self._achievement_periodic_check(
                     target,
@@ -697,6 +704,7 @@ class SteamFriendMonitor(Star):
         game_name: str,
     ):
         key = self._achievement_key(target, sid, gameid)
+        cache_key = self.achievement_monitor._make_key(target, sid, gameid)
         try:
             await asyncio.sleep(self._achievement_final_delay_sec())
             if gameid in self.achievement_monitor.achievement_blacklist:
@@ -723,6 +731,11 @@ class SteamFriendMonitor(Star):
                     game_name,
                     new_achievements,
                 )
+            
+            # 游戏结束后，将当前成就状态保存到持久化缓存（标记为已推送过）
+            # 这样下次玩家再玩此游戏时，就不会因为插件重启而重复推送成就
+            self.achievement_monitor.initial_achievements[cache_key] = list(current)
+            self.achievement_monitor._save_achievements_cache()
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -731,7 +744,6 @@ class SteamFriendMonitor(Star):
             )
         finally:
             self.achievement_snapshots.pop(key, None)
-            self.achievement_monitor.clear_game_achievements(target, sid, gameid)
 
     async def _notify_new_achievements(
         self,

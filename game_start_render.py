@@ -230,14 +230,6 @@ def get_chinese_length(text):
             length += 0.5
     return int(length + 0.5)
 
-
-def pad_game_name(game_name, min_cn_len=10):
-    """游戏名后方补空格，渲染满10个中文字符宽度"""
-    cur_len = get_chinese_length(game_name)
-    pad_len = max(0, min_cn_len - cur_len)
-    return game_name + "　" * pad_len + "   "  # 中文全角空格+3半角空格
-
-
 def render_gradient_bg(img_w, img_h, color_top, color_bottom):
     """生成竖向渐变背景"""
     base = Image.new("RGB", (img_w, img_h), color_top)
@@ -371,10 +363,47 @@ def render_game_start_image(
     # 4. 文本：头像右侧，整体垂直居中，左右留白，无背景
     text_x = avatar_x + avatar_size + avatar_margin
     text_area_w = img_w - text_x - avatar_margin
-    game_name_lines = text_wrap(str(game_name or ""), font, text_area_w)
+    
+    # 游戏名自适应字号（优先缩小字号使其单行显示，不行则截断）
+    game_name_str = str(game_name or "")
+    game_name_font_size = 22
+    game_name_display = game_name_str
+    min_font_size = 14
+    
+    for size in range(22, min_font_size - 1, -1):
+        try:
+            game_font_tmp = ImageFont.truetype(font_regular, size)
+        except Exception:
+            game_font_tmp = ImageFont.load_default()
+        bbox = draw.textbbox((0, 0), game_name_display, font=game_font_tmp)
+        if bbox[2] - bbox[0] <= text_area_w:
+            game_name_font_size = size
+            break
+    else:
+        # 字号已到最小仍放不下，则截断游戏名
+        try:
+            game_font_min = ImageFont.truetype(font_regular, min_font_size)
+        except Exception:
+            game_font_min = ImageFont.load_default()
+        game_name_display = game_name_str
+        for i in range(len(game_name_str) - 1, 0, -1):
+            truncated = game_name_str[:i] + "..."
+            bbox = draw.textbbox((0, 0), truncated, font=game_font_min)
+            if bbox[2] - bbox[0] <= text_area_w:
+                game_name_display = truncated
+                break
+        else:
+            game_name_display = "..."
+        game_name_font_size = min_font_size
+    
+    try:
+        font_game_final = ImageFont.truetype(font_regular, game_name_font_size)
+    except Exception:
+        font_game_final = ImageFont.load_default()
+    
     line_height = 36
-    # 只为游戏时长多加一行
-    block_height = line_height * (2 + len(game_name_lines)) + 10 + font_small.size + 4
+    # 游戏名只占一行
+    block_height = line_height * 3 + 10 + font_small.size + 4  # 玩家名 + 正在玩 + 游戏名(单行) + 时长
     text_y = (img_h - block_height) // 2
 
     # 将头像Y坐标与玩家名对齐，并下移10像素
@@ -401,12 +430,12 @@ def render_game_start_image(
             font_online = ImageFont.truetype(font_regular, 14)
         except Exception:
             font_online = ImageFont.load_default()
-        online_text = f"●玩家人数{online_count}"
+        online_text = f"在线人数 {online_count}"
         text_bbox = draw.textbbox((0, 0), online_text, font=font_online)
         online_text_w = text_bbox[2] - text_bbox[0] + 10  # 加右侧边距
 
     # 玩家名自适应字号，防止出界和与在线人数重叠
-    max_playername_w = IMG_W - (text_x + 8) - online_text_w - 24
+    max_playername_w = IMG_W - (text_x + 8) - online_text_w - 30
     player_font_size = 28
     for size in range(28, 15, -2):
         try:
@@ -425,13 +454,12 @@ def render_game_start_image(
 
     # “正在玩”
     draw.text((text_x + 8, text_y + line_height), "正在玩", font=font, fill=(200, 255, 200, 255))
-    # 游戏名多行（亮绿色 129,173,81）
-    for idx, line in enumerate(game_name_lines):
-        draw.text((text_x + 8, text_y + line_height * 2 + idx * line_height), line, font=font, fill=(129, 173, 81, 255))
-    # 游戏时长（紧跟在最后一行游戏名下方，无多余空行）
+    # 游戏名单行显示（亮绿色 129,173,81）
+    draw.text((text_x + 8, text_y + line_height * 2), game_name_display, font=font_game_final, fill=(129, 173, 81, 255))
+    # 游戏时长（紧跟在游戏名下方，无多余空行）
     if playtime_hours is not None:
         playtime_str = f"游戏时间 {playtime_hours} 小时"
-        y_time = text_y + line_height * 2 + len(game_name_lines) * line_height + 4  # 仅加4像素间距
+        y_time = text_y + line_height * 3 + 4  # 游戏名下一行
         draw.text((text_x + 8, y_time), playtime_str, font=font_small, fill=(120, 180, 255, 255))
         print(f"[render_game_start_image] 渲染游戏时长: {playtime_str}")
     else:
