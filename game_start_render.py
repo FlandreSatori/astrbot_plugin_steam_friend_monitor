@@ -10,6 +10,8 @@ BG_COLOR_BOTTOM = (28, 35, 44)
 AVATAR_SIZE = 80
 COVER_W, COVER_H = 80, 120
 IMG_W, IMG_H = 512, 192  # 16:6，画布高度减少三分之一
+# 星星素材路径
+STAR_BG_PATH = os.path.join(os.path.dirname(__file__), "star_767x809.png")
 
 
 def get_avatar_path(data_dir, steamid, url, force_update=False):
@@ -325,7 +327,23 @@ def render_game_start_image(
     img = render_gradient_bg(img_w, img_h, BG_COLOR_TOP, BG_COLOR_BOTTOM).convert("RGBA")
     draw = ImageDraw.Draw(img)
 
-    # 1. 封面图贴左，等比例缩放高度，宽度自适应，左贴右留空，不裁剪
+    # 1. 背景星星横向平铺（等比例缩放高度，透明度30%）
+    try:
+        star_bg = Image.open(STAR_BG_PATH).convert("RGBA")
+        star_w, star_h = star_bg.size
+        scale = IMG_H / star_h
+        new_w = int(star_w * scale)
+        new_h = IMG_H
+        star_bg_resized = star_bg.resize((new_w, new_h), Image.LANCZOS)
+        # 设置透明度30%
+        alpha = star_bg_resized.split()[-1].point(lambda p: int(p * 0.3))
+        star_bg_resized.putalpha(alpha)
+        for x in range(0, IMG_W, new_w):
+            img.alpha_composite(star_bg_resized, (x, 0))
+    except Exception as e:
+        print(f"[render_game_start_image] 星星背景加载失败: {e}")
+
+    # 2. 封面图贴左，等比例缩放高度，宽度自适应，左贴右留空，不裁剪
     cover_area_h = IMG_H
     new_w = COVER_W  # 默认宽度，防止后续变量未定义
     if cover_path and os.path.exists(cover_path):
@@ -340,14 +358,14 @@ def render_game_start_image(
             print(f"[render_game_start_image] 封面渲染失败: {e}")
             new_w = COVER_W  # 渲染失败时使用默认宽度
 
-    # 2. 头像位置参数（不再渲染头像）
+    # 3. 头像位置参数（不再渲染头像）
     avatar_size = AVATAR_SIZE
     avatar_margin = 24
     cover_right = int(new_w)
     avatar_x = cover_right + avatar_margin
     # avatar_y 的赋值和渲染放到后面
 
-    # 3. 文本：头像右侧，整体垂直居中，左右留白，无背景
+    # 4. 文本：头像右侧，整体垂直居中，左右留白，无背景
     text_x = avatar_x + avatar_size + avatar_margin
     text_area_w = img_w - text_x - avatar_margin
     game_name_lines = text_wrap(str(game_name or ""), font, text_area_w)
