@@ -680,7 +680,7 @@ class SteamFriendMonitor(Star):
                         game_name,
                         new_achievements,
                     )
-                self.achievement_snapshots[key] = list(current)
+                # 不在周期检查中更新快照，快照只在游戏开始时记录，确保最终检查与开始时比对
         except asyncio.CancelledError:
             pass
         except Exception as e:
