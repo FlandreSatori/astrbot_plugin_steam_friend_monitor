@@ -422,20 +422,17 @@ def render_game_start_image(
             img.alpha_composite(avatar_rgba, (avatar_x, avatar_y))
         except Exception as e:
             print(f"[render_game_start_image] 头像渲染失败: {e}")
-    # 新增：右上角显示在线人数，提前计算宽度
+    # 新增：右上角显示在线人数
     online_text = None
-    online_text_w = 0
     if online_count is not None:
         try:
             font_online = ImageFont.truetype(font_regular, 14)
         except Exception:
             font_online = ImageFont.load_default()
-        online_text = f"在线人数 {online_count}"
-        text_bbox = draw.textbbox((0, 0), online_text, font=font_online)
-        online_text_w = text_bbox[2] - text_bbox[0] + 10  # 加右侧边距
+        online_text = f"·在线人数 {online_count}"
 
-    # 玩家名自适应字号，防止出界和与在线人数重叠
-    max_playername_w = IMG_W - (text_x + 8) - online_text_w - 30
+    # 玩家名自适应字号
+    max_playername_w = IMG_W - (text_x + 8) - 24
     player_font_size = 28
     for size in range(28, 15, -2):
         try:
@@ -465,8 +462,10 @@ def render_game_start_image(
     else:
         print("[render_game_start_image] 未获取到游戏时长，playtime_hours=None")
 
-    # 在线人数渲染（放在最后，确保不会被玩家名遮挡）
+    # 在线人数渲染（右上角）
     if online_text:
+        text_bbox = draw.textbbox((0, 0), online_text, font=font_online)
+        online_text_w = text_bbox[2] - text_bbox[0] + 10
         draw.text((IMG_W - online_text_w, 10), online_text, font=font_online, fill=(120, 180, 255, 180))
 
     return img.convert("RGB")
