@@ -11,6 +11,6 @@ desc: |-
   ·频繁上下线可以过滤
   ·增加游玩时长统计
   ·新增配置，可以不统计离开状态的时长
-version: 0.6.1
+version: 0.6.2
 author: FlandreSatori
 repo: https://github.com/FlandreSatori/astrbot_plugin_steam_friend_monitor

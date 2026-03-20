@@ -164,6 +164,10 @@ class SteamFriendMonitor(Star):
         self.achievement_snapshots: Dict[tuple[str, str, str], List[str]] = {}
         self.achievement_fail_count: Dict[tuple[str, str], int] = {}
 
+    # 字体初始化
+    self.font_paths: Dict[str, str | None] = {}
+    self._ensure_fonts()
+
     def _load_local_config_defaults(self) -> Dict[str, Any]:
         cfg_path = self.plugin_dir / "config.json"
         if not cfg_path.exists():
@@ -180,6 +184,46 @@ class SteamFriendMonitor(Star):
         if not value:
             return default
         return str(value).rstrip("/")
+
+    def _ensure_fonts(self):
+        """检测插件fonts目录是否有NotoSansHans系列字体，并缓存路径"""
+        import shutil
+        plugin_fonts_dir = self.plugin_dir / 'fonts'
+        cache_fonts_dir = self.data_dir / 'fonts'
+        plugin_fonts_dir.mkdir(parents=True, exist_ok=True)
+        cache_fonts_dir.mkdir(parents=True, exist_ok=True)
+
+        font_candidates = [
+            'NotoSansHans-Regular.otf',
+            'NotoSansHans-Medium.otf',
+            'NotoSansCJKsc-Regular.otf',  # 兼容旧版本
+        ]
+        self.font_paths = {}
+        for font_name in font_candidates:
+            plugin_font_path = plugin_fonts_dir / font_name
+            cache_font_path = cache_fonts_dir / font_name
+            if plugin_font_path.exists():
+                shutil.copy(str(plugin_font_path), str(cache_font_path))
+                self.font_paths[font_name] = str(cache_font_path)
+            elif cache_font_path.exists():
+                self.font_paths[font_name] = str(cache_font_path)
+            else:
+                self.font_paths[font_name] = None
+
+        # 详细日志
+        for font_name in font_candidates:
+            path = self.font_paths.get(font_name)
+            logger.debug(f"[steam-monitor] font cache - {font_name}: {path}")
+        if not any(self.font_paths.values()):
+            logger.warning("[steam-monitor] no CJK font found, rendering may show garbled text")
+
+    def get_font_path(self, font_name: str | None = None, bold: bool = False) -> str:
+        """获取字体路径，优先返回缓存目录下的NotoSansHans字体"""
+        if not font_name:
+            font_name = 'NotoSansHans-Regular.otf'
+        if bold:
+            font_name = 'NotoSansHans-Medium.otf'
+        return self.font_paths.get(font_name) or font_name
 
     async def initialize(self):
         self.achievement_monitor.steam_api_base = self.STEAM_API_BASE
@@ -735,9 +779,9 @@ class SteamFriendMonitor(Star):
                 if unlocked_set is None:
                     unlocked_set = set()
 
-                font_path = str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
-                if not Path(font_path).exists():
-                    font_path = ""
+                font_path = self.get_font_path("NotoSansHans-Regular.otf") or str(
+                    self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf"
+                )
 
                 img_bytes = await self.achievement_monitor.render_achievement_image(
                     details,
@@ -850,9 +894,9 @@ class SteamFriendMonitor(Star):
         try:
             zh_game_name, en_game_name = await self._get_game_names(gameid, game_name)
             online_count = await self._get_game_online_count(gameid)
-            font_path = str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
-            if not Path(font_path).exists():
-                font_path = ""
+            font_path = self.get_font_path("NotoSansHans-Regular.otf") or str(
+                self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf"
+            )
 
             img_bytes = await render_game_start(
                 str(self.data_dir),
@@ -881,7 +925,7 @@ class SteamFriendMonitor(Star):
 
             chain = MessageChain()
             chain.chain = [
-                Comp.Plain(text=f"🟢【{player_name}】开始游玩 {zh_game_name}"),
+                Comp.Plain(text=f"{player_name} 启动 {zh_game_name}"),
                 Comp.Image.fromFileSystem(tmp_path),
             ]
             await self.context.send_message(target, chain)
@@ -1389,7 +1433,10 @@ class SteamFriendMonitor(Star):
                 logger.warning(
                     f"[steam-monitor] game icon metadata fetch empty appid={appid}"
                 )
-                return None
+                icon_url = await self._get_sgdb_game_icon_url(appid)
+                if icon_url:
+                    self._cache_set(self.icon_url_cache, appid, icon_url, "icon")
+                return icon_url
 
             data = json.loads(raw.decode("utf-8", errors="ignore"))
             node = data.get(str(appid), {})
@@ -1397,9 +1444,14 @@ class SteamFriendMonitor(Star):
                 logger.warning(
                     f"[steam-monitor] game metadata success=false appid={appid}"
                 )
-                return None
+                icon_url = await self._get_sgdb_game_icon_url(appid)
+                if icon_url:
+                    self._cache_set(self.icon_url_cache, appid, icon_url, "icon")
+                return icon_url
             app = node.get("data", {})
             icon_url = app.get("header_image") or app.get("capsule_image")
+            if not icon_url:
+                icon_url = await self._get_sgdb_game_icon_url(appid)
             if icon_url:
                 self._cache_set(self.icon_url_cache, appid, icon_url, "icon")
                 logger.debug(
@@ -1414,10 +1466,57 @@ class SteamFriendMonitor(Star):
             logger.warning(
                 f"[steam-monitor] game icon metadata fetch network error appid={appid}: {type(e).__name__}"
             )
-            # 网络错误时返回 None，下次会重新尝试，但本次不中断处理
-            return None
+            icon_url = await self._get_sgdb_game_icon_url(appid)
+            if icon_url:
+                self._cache_set(self.icon_url_cache, appid, icon_url, "icon")
+            return icon_url
         except Exception as e:
             logger.warning(f"[steam-monitor] parse game icon failed appid={appid}: {e}")
+            icon_url = await self._get_sgdb_game_icon_url(appid)
+            if icon_url:
+                self._cache_set(self.icon_url_cache, appid, icon_url, "icon")
+            return icon_url
+
+    async def _get_sgdb_game_icon_url(self, appid: str) -> str | None:
+        """使用 SteamGridDB 为状态图提供横幅封面兜底。"""
+        gid = str(appid or "").strip()
+        if not gid or not self.SGDB_API_KEY:
+            return None
+
+        headers = {"Authorization": f"Bearer {self.SGDB_API_KEY}"}
+        try:
+            if not self.http:
+                self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
+
+            game_url = f"{self.SGDB_API_BASE}/api/v2/games/steam/{gid}"
+            resp_game = await self.http.get(game_url, headers=headers)
+            if resp_game.status_code != 200:
+                return None
+            game_data = resp_game.json()
+            if not game_data.get("success") or not game_data.get("data"):
+                return None
+
+            sgdb_game_id = game_data["data"].get("id")
+            if not sgdb_game_id:
+                return None
+
+            grid_url = (
+                f"{self.SGDB_API_BASE}/api/v2/grids/game/{sgdb_game_id}"
+                "?dimensions=460x215&type=static&limit=1"
+            )
+            resp_grid = await self.http.get(grid_url, headers=headers)
+            if resp_grid.status_code != 200:
+                return None
+            grid_data = resp_grid.json()
+            if not grid_data.get("success") or not grid_data.get("data"):
+                return None
+
+            first = grid_data["data"][0] if grid_data["data"] else None
+            if not isinstance(first, dict):
+                return None
+            return str(first.get("url") or "").strip() or None
+        except Exception as e:
+            logger.debug(f"[steam-monitor] sgdb icon fallback failed appid={gid}: {e}")
             return None
 
     def _profile_game_fallback_enabled(self) -> bool:
@@ -2754,9 +2853,8 @@ class SteamFriendMonitor(Star):
 
         sample_count = max(1, min(int(count or 1), len(achievements)))
         unlocked = set(random.sample(list(achievements), sample_count))
-        font_path = str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
-        if not Path(font_path).exists():
-            font_path = ""
+
+        font_path = self.get_font_path("NotoSansHans-Regular.otf") or str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
 
         try:
             img_bytes = await self.achievement_monitor.render_achievement_image(
@@ -2805,9 +2903,8 @@ class SteamFriendMonitor(Star):
 
             zh_game_name, en_game_name = await self._get_game_names(gid, fallback_name=gid)
             online_count = await self._get_game_online_count(gid)
-            font_path = str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
-            if not Path(font_path).exists():
-                font_path = ""
+
+            font_path = self.get_font_path("NotoSansHans-Regular.otf") or str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
 
             img_bytes = await render_game_start(
                 str(self.data_dir),

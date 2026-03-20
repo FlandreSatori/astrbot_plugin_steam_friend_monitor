@@ -1,5 +1,7 @@
 import json
 import io
+import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
@@ -24,6 +26,8 @@ class AchievementMonitor:
 
         self.achievements_file = self.data_dir / "achievements_cache.json"
         self.blacklist_file = self.data_dir / "achievement_blacklist.json"
+        self.icon_cache_dir = self.data_dir / "achievement_icons"
+        self.icon_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.initial_achievements: Dict[str, list[str]] = {}
         self.achievement_blacklist: set[str] = set()
@@ -317,6 +321,55 @@ class AchievementMonitor:
             lines.append(line)
         return lines
 
+    def _icon_cache_path(self, icon_url: str) -> Path:
+        digest = hashlib.sha256(icon_url.encode("utf-8", errors="ignore")).hexdigest()
+        return self.icon_cache_dir / f"{digest}.png"
+
+    async def _load_achievement_icon(
+        self,
+        session: aiohttp.ClientSession,
+        icon_url: str,
+        icon_size: int,
+    ) -> Image.Image | None:
+        if not icon_url:
+            return None
+
+        cache_path = self._icon_cache_path(icon_url)
+        raw: bytes | None = None
+
+        if cache_path.exists():
+            try:
+                raw = cache_path.read_bytes()
+            except Exception as e:
+                logger.debug(f"[steam-monitor] read icon cache failed: {e}")
+
+        if raw is None:
+            try:
+                async with session.get(icon_url) as response:
+                    if response.status == 200:
+                        raw = await response.read()
+                        if raw:
+                            try:
+                                cache_path.write_bytes(raw)
+                            except Exception as e:
+                                logger.debug(f"[steam-monitor] write icon cache failed: {e}")
+            except Exception as e:
+                logger.debug(f"[steam-monitor] download icon failed: {e}")
+
+        if not raw:
+            return None
+
+        try:
+            icon_img = Image.open(io.BytesIO(raw)).convert("RGBA")
+            icon_img = icon_img.resize((icon_size, icon_size), Image.LANCZOS)
+            mask_icon = Image.new("L", (icon_size, icon_size), 0)
+            ImageDraw.Draw(mask_icon).rounded_rectangle((0, 0, icon_size, icon_size), 12, fill=255)
+            icon_img.putalpha(mask_icon)
+            return icon_img
+        except Exception as e:
+            logger.debug(f"[steam-monitor] decode icon failed: {e}")
+            return None
+
     async def render_achievement_image(
         self,
         achievement_details: dict,
@@ -371,7 +424,7 @@ class AchievementMonitor:
         if not game_name:
             game_name = "未知游戏"
 
-        now_str = __import__("datetime").datetime.datetime.now().strftime("%m-%d %H:%M")
+        now_str = datetime.now().strftime("%m-%d %H:%M")
 
         fonts_dir = Path(__file__).parent / "fonts"
         default_regular = fonts_dir / "NotoSansHans-Regular.otf"
@@ -384,6 +437,32 @@ class AchievementMonitor:
             font_medium = default_medium
         if not font_regular.exists():
             font_regular = default_regular
+
+        # 尝试多个字体位置：传入路径 -> 数据目录 -> 插件目录
+        if font_path and Path(font_path).exists():
+            font_regular = Path(font_path)
+        else:
+            # 尝试从数据目录加载
+            data_fonts_dir = self.data_dir / "fonts"
+            candidate_regular = data_fonts_dir / "NotoSansHans-Regular.otf"
+            if candidate_regular.exists():
+                font_regular = candidate_regular
+            else:
+                # 从插件目录加载
+                font_regular = fonts_dir / "NotoSansHans-Regular.otf"
+
+        # 替换为Medium版本（从同目录）
+        font_medium = Path(str(font_regular).replace("Regular", "Medium"))
+        if not font_medium.exists():
+            # 尝试找到Medium文件的备选
+            data_fonts_dir = self.data_dir / "fonts"
+            candidate_medium = data_fonts_dir / "NotoSansHans-Medium.otf"
+            if candidate_medium.exists():
+                font_medium = candidate_medium
+            else:
+                font_medium = fonts_dir / "NotoSansHans-Medium.otf"
+        if not font_medium.exists():
+            font_medium = font_regular  # 回退到Regular版本
 
         try:
             font_title = ImageFont.truetype(str(font_medium), 20)
@@ -532,17 +611,7 @@ class AchievementMonitor:
                 icon_url = detail.get("icon")
                 icon_img = None
                 if icon_url:
-                    try:
-                        async with session.get(icon_url) as response:
-                            if response.status == 200:
-                                icon_data = await response.read()
-                                icon_img = Image.open(io.BytesIO(icon_data)).convert("RGBA")
-                                icon_img = icon_img.resize((icon_size, icon_size), Image.LANCZOS)
-                                mask_icon = Image.new("L", (icon_size, icon_size), 0)
-                                ImageDraw.Draw(mask_icon).rounded_rectangle((0, 0, icon_size, icon_size), 12, fill=255)
-                                icon_img.putalpha(mask_icon)
-                    except Exception:
-                        pass
+                    icon_img = await self._load_achievement_icon(session, str(icon_url), icon_size)
 
                 icon_x = card_x0 + 12
                 icon_y = card_y0 + (card_h - icon_size) // 2
