@@ -29,8 +29,8 @@
 | `status_image_min_interval_min` | `3` | 状态图片推送最小间隔（分钟），`0` 表示不限制 |
 | `presence_flap_suppress_min` | `2` | 上下线抖动抑制窗口（分钟），`X`分钟内反复上下线会被视为始终在线 |
 | `count_game_duration_online_only` | `false` | 如果是，则“离开”状态不统计游戏时长 |
-| `status_text_trigger_types` | `online,offline,game_start,game_stop,game_switch` | 哪些事件会触发文字推送；可选：`online` `offline` `game_start` `game_stop` `game_switch` |
-| `status_image_trigger_types` | `online,offline,game_start,game_stop,game_switch` | 哪些事件会触发状态图推送；可选：`online` `offline` `game_start` `game_stop` `game_switch` |
+| `status_text_trigger_types` | `online,game_stop,game_switch` | 哪些事件会触发文字推送；可选：`online` `offline` `game_start` `game_stop` `game_switch` |
+| `status_image_trigger_types` |  | 哪些事件会触发状态图推送；可选：`online` `offline` `game_start` `game_stop` `game_switch` |
 | `enable_achievement_monitor` | `true` | 是否开启成就监控 |
 | `achievement_poll_interval_sec` | `1200` | 成就轮询间隔（秒） |
 | `achievement_final_check_delay_sec` | `300` | 游戏结束后多久再检查一次成就（秒） |
@@ -98,6 +98,6 @@
 
 1. 原命令较为繁琐，但考虑到可以在 AstrBot插件 - 管理行为 - 重命名 处添加别名，因此推荐安装后手动添加多个别名。
 
-   例如`/sfm_status` -> `/视奸，`/sfm_add_group_id` -> `/add`
+   例如`/sfm_status` -> `/视奸`, `/sfm_add_group_id`-> `/add`
 
 2. 添加的命令可以给予所有人权限，删除只给管理员权限。
