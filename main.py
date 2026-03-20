@@ -925,7 +925,7 @@ class SteamFriendMonitor(Star):
 
             chain = MessageChain()
             chain.chain = [
-                Comp.Plain(text=f"{player_name} 启动 {zh_game_name}"),
+                # Comp.Plain(text=f"{player_name} 启动 {zh_game_name}"),
                 Comp.Image.fromFileSystem(tmp_path),
             ]
             await self.context.send_message(target, chain)

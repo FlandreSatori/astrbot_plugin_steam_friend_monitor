@@ -350,8 +350,7 @@ def render_game_start_image(
     # 3. 文本：头像右侧，整体垂直居中，左右留白，无背景
     text_x = avatar_x + avatar_size + avatar_margin
     text_area_w = img_w - text_x - avatar_margin
-    game_name_padded = pad_game_name(game_name, min_cn_len=10)
-    game_name_lines = text_wrap(game_name_padded, font, text_area_w)
+    game_name_lines = text_wrap(str(game_name or ""), font, text_area_w)
     line_height = 36
     # 只为游戏时长多加一行
     block_height = line_height * (2 + len(game_name_lines)) + 10 + font_small.size + 4
