@@ -79,7 +79,7 @@
     "default": 5
   },
   "enable_game_start_render": {
-    "description": "是否启用开始游戏图片渲染推送",
+    "description": "是否启用额外的的 开始游戏 卡片推送",
     "type": "bool",
     "default": true
   },

@@ -1135,6 +1135,34 @@ class SteamFriendMonitor(Star):
 
         return ordered + rest
 
+    def _get_players_from_state_snapshot(
+        self, target: str, steam_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """从本地状态快照构造玩家列表，用于手动状态展示。"""
+        ids = _dedup_keep_order(steam_ids)
+        target_state = self._get_target_player_state(target)
+        players: List[Dict[str, Any]] = []
+
+        for sid in ids:
+            record = target_state.get(sid)
+            if not isinstance(record, dict) or not record:
+                data = self.state.get(sid, {})
+                record = data if isinstance(data, dict) else {}
+            if not record:
+                continue
+
+            players.append(
+                {
+                    "steamid": sid,
+                    "personaname": record.get("personaname", sid),
+                    "personastate": self._safe_int(record.get("personastate", 0), 0),
+                    "gameid": str(record.get("gameid", "") or ""),
+                    "gameextrainfo": (record.get("gameextrainfo", "") or "").strip(),
+                }
+            )
+
+        return players
+
     def _is_private_host(self, host: str) -> bool:
         host = (host or "").strip().lower()
         if not host:
@@ -2060,6 +2088,52 @@ class SteamFriendMonitor(Star):
         logger.info(f"[steam-monitor] render status image done output={out}")
         return out
 
+    def _apply_presence_flap_view_state(
+        self, players: List[Dict[str, Any]], target: str
+    ) -> List[Dict[str, Any]]:
+        """渲染状态图前，对候选离线玩家应用展示态修正，保证与抖动抑制策略一致。"""
+        flap_suppress_sec = self._presence_flap_suppress_min() * 60
+        if flap_suppress_sec <= 0:
+            return players
+
+        target_state = self._get_target_player_state(target)
+        now_dt = datetime.now()
+        adjusted_players: List[Dict[str, Any]] = []
+
+        for p in players:
+            sid = str(p.get("steamid", "") or "")
+            if not sid:
+                adjusted_players.append(p)
+                continue
+
+            prev_record = target_state.get(sid, {})
+            if not isinstance(prev_record, dict):
+                adjusted_players.append(p)
+                continue
+
+            current_st = self._safe_int(p.get("personastate", 0), 0)
+            prev_st = self._safe_int(prev_record.get("personastate", 0), 0)
+            pending_offline_since = str(prev_record.get("presence_flap_offline_since", "") or "")
+            pending_confirmed = bool(prev_record.get("presence_flap_confirmed", False))
+
+            if (
+                current_st == 0
+                and prev_st != 0
+                and pending_offline_since
+                and not pending_confirmed
+            ):
+                pending_dt = parse_iso(pending_offline_since)
+                if pending_dt and (now_dt - pending_dt).total_seconds() < flap_suppress_sec:
+                    # 候选离线窗口内，状态图仍展示为上一次在线态。
+                    fixed = dict(p)
+                    fixed["personastate"] = prev_st
+                    adjusted_players.append(fixed)
+                    continue
+
+            adjusted_players.append(p)
+
+        return adjusted_players
+
     async def _push_image(self, umo: str, text: str, image_path: str):
         logger.info(
             f"[steam-monitor] push image start target={umo} image_path={image_path} text_len={len(text or '')}"
@@ -2183,7 +2257,11 @@ class SteamFriendMonitor(Star):
                 await asyncio.sleep(30)
 
     async def _poll_for_target(
-        self, target: str, steam_ids: List[str], default_interval: int
+        self,
+        target: str,
+        steam_ids: List[str],
+        default_interval: int,
+        emit_push: bool = True,
     ):
         """为单个 target 执行一次轮询"""
         image_path = None
@@ -2575,7 +2653,7 @@ class SteamFriendMonitor(Star):
 
             self._save_state()
 
-            if events:
+            if emit_push and events:
                 text_trigger_types = self._status_text_trigger_types()
                 image_trigger_types = self._status_image_trigger_types()
                 send_text = bool(event_types & text_trigger_types)
@@ -2622,6 +2700,9 @@ class SteamFriendMonitor(Star):
                 try:
                     if send_image:
                         ordered_players = self._order_players_by_ids(players, steam_ids)
+                        ordered_players = self._apply_presence_flap_view_state(
+                            ordered_players, target
+                        )
                         image_path = await self._render_status_image(ordered_players, target)
                         if send_text:
                             await self._push_image(target, text, image_path)
@@ -2751,9 +2832,26 @@ class SteamFriendMonitor(Star):
 
         image_path = None
         try:
-            players = await self._fetch_players(steam_ids)
-            players = await self._enrich_players_with_profile_game_fallback(players)
-            ordered_players = self._order_players_by_ids(players, steam_ids)
+            ordered_players = self._get_players_from_state_snapshot(
+                event.unified_msg_origin, steam_ids
+            )
+            if not ordered_players:
+                default_interval = int(self.config.get("poll_interval_sec", 60) or 60)
+                await self._poll_for_target(
+                    event.unified_msg_origin,
+                    steam_ids,
+                    default_interval,
+                    emit_push=False,
+                )
+                ordered_players = self._get_players_from_state_snapshot(
+                    event.unified_msg_origin, steam_ids
+                )
+            if not ordered_players:
+                yield event.plain_result("本地状态为空，请等待下一次自动轮询后重试")
+                return
+            ordered_players = self._apply_presence_flap_view_state(
+                ordered_players, event.unified_msg_origin
+            )
             image_path = await self._render_status_image(
                 ordered_players, event.unified_msg_origin
             )
@@ -2810,9 +2908,23 @@ class SteamFriendMonitor(Star):
 
         image_path = None
         try:
-            players = await self._fetch_players(steam_ids)
-            players = await self._enrich_players_with_profile_game_fallback(players)
-            ordered_players = self._order_players_by_ids(players, steam_ids)
+            ordered_players = self._get_players_from_state_snapshot(
+                event.unified_msg_origin, steam_ids
+            )
+            if not ordered_players:
+                default_interval = int(self.config.get("poll_interval_sec", 60) or 60)
+                await self._poll_for_target(
+                    event.unified_msg_origin,
+                    steam_ids,
+                    default_interval,
+                    emit_push=False,
+                )
+                ordered_players = self._get_players_from_state_snapshot(
+                    event.unified_msg_origin, steam_ids
+                )
+            if not ordered_players:
+                yield event.plain_result("[steam_monitor_test] 本地状态为空，请等待自动轮询后重试")
+                return
             status_text = chr(10).join(
                 [
                     f"{p.get('personaname', '?')}: {persona_text(int(p.get('personastate', 0)))}"
@@ -2828,6 +2940,9 @@ class SteamFriendMonitor(Star):
             if action in ("status", "pull"):
                 yield event.plain_result(
                     "[steam_monitor_test: status]" + chr(10) + status_text
+                )
+                ordered_players = self._apply_presence_flap_view_state(
+                    ordered_players, event.unified_msg_origin
                 )
                 return
 
