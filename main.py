@@ -2253,7 +2253,6 @@ class SteamFriendMonitor(Star):
                         "missing": True,
                     }
                     target_state[sid] = next_record
-                    self.state[sid] = next_record
                     if prev is not None and prev != 0:
                         events.append(
                             f"{prev_record.get('personaname', sid)}: 下线（接口未返回）"
@@ -2369,22 +2368,26 @@ class SteamFriendMonitor(Star):
                 suppress_online_event = False
                 suppress_offline_event = False
 
-                # 抖动抑制：在线->离线先进入候选状态，窗口内恢复不播报上下线
+                # 抖动抑制：在线->离线先进入候选状态；候选期内保持在线状态。
+                # 仅当离线持续超过窗口时，才真正切换为离线。
                 if flap_suppress_sec > 0 and prev is not None:
-                    if prev != 0 and st == 0:
-                        pending_offline_since = now
-                        pending_prev_game = prev_game
-                        pending_prev_game_start_ts = prev_game_start_ts
-                        pending_prev_game_accum_seconds = game_accum_seconds
-                        pending_confirmed = False
-                        suppress_offline_event = True
-                    elif prev == 0 and st == 0 and pending_offline_since and not pending_confirmed:
+                    if st == 0 and prev != 0:
+                        if not pending_offline_since:
+                            pending_offline_since = now
+                            pending_prev_game = prev_game
+                            pending_prev_game_start_ts = prev_game_start_ts
+                            pending_prev_game_accum_seconds = game_accum_seconds
+                            pending_confirmed = False
+
                         pending_dt = parse_iso(pending_offline_since)
-                        if pending_dt and (now_dt - pending_dt).total_seconds() >= flap_suppress_sec:
-                            events.append(f"{p.get('personaname', '?')} 下线")
-                            event_types.add("offline")
+                        if not pending_dt or (now_dt - pending_dt).total_seconds() < flap_suppress_sec:
+                            # 候选期内保持在线状态，不触发上下线事件。
+                            st = prev_st
+                            suppress_offline_event = True
+                        else:
+                            # 超过窗口，确认离线；允许后续通用事件分支发出下线事件。
                             if pending_prev_game:
-                                pending_end = pending_dt
+                                pending_end = pending_dt or now_dt
                                 daily_game_seconds += pending_prev_game_accum_seconds
                                 daily_game_seconds += self._session_seconds_in_current_cycle(
                                     pending_prev_game_start_ts,
@@ -2392,10 +2395,31 @@ class SteamFriendMonitor(Star):
                                     cycle_start,
                                 )
                                 game_accum_seconds = 0
-                                game_start_ts = None
+                                if game_start_ts == pending_prev_game_start_ts:
+                                    game_start_ts = None
                                 pending_prev_game_accum_seconds = 0
                             pending_confirmed = True
-                    elif prev == 0 and st != 0 and pending_offline_since:
+
+                    elif st == 0 and prev == 0 and pending_offline_since and not pending_confirmed:
+                        pending_dt = parse_iso(pending_offline_since)
+                        if not pending_dt or (now_dt - pending_dt).total_seconds() < flap_suppress_sec:
+                            suppress_offline_event = True
+                        else:
+                            if pending_prev_game:
+                                pending_end = pending_dt or now_dt
+                                daily_game_seconds += pending_prev_game_accum_seconds
+                                daily_game_seconds += self._session_seconds_in_current_cycle(
+                                    pending_prev_game_start_ts,
+                                    pending_end,
+                                    cycle_start,
+                                )
+                                game_accum_seconds = 0
+                                if game_start_ts == pending_prev_game_start_ts:
+                                    game_start_ts = None
+                                pending_prev_game_accum_seconds = 0
+                            pending_confirmed = True
+
+                    elif st != 0 and pending_offline_since:
                         pending_dt = parse_iso(pending_offline_since)
                         elapsed = None
                         if pending_dt:
@@ -2423,26 +2447,6 @@ class SteamFriendMonitor(Star):
                                     cycle_start,
                                 )
                                 pending_prev_game_accum_seconds = 0
-                        else:
-                            # 窗口过期后恢复在线：报告下线，但不再报告上线（避免重复）
-                            if not pending_confirmed:
-                                events.append(f"{p.get('personaname', '?')} 下线")
-                                event_types.add("offline")
-                                if pending_prev_game:
-                                    pending_end = pending_dt or now_dt
-                                    daily_game_seconds += pending_prev_game_accum_seconds
-                                    daily_game_seconds += self._session_seconds_in_current_cycle(
-                                        pending_prev_game_start_ts,
-                                        pending_end,
-                                        cycle_start,
-                                    )
-                                    game_accum_seconds = 0
-                                    pending_prev_game_accum_seconds = 0
-                                    if game_start_ts == pending_prev_game_start_ts:
-                                        game_start_ts = None
-                            # 窗口过期后恢复时抑制上线播报，避免出现"下线"后立即"上线"
-                            suppress_online_event = True
-
                         pending_offline_since = ""
                         pending_prev_game = ""
                         pending_prev_game_start_ts = None
@@ -2474,7 +2478,6 @@ class SteamFriendMonitor(Star):
                     "missing": False,
                 }
                 target_state[sid] = next_record
-                self.state[sid] = next_record
 
                 if prev is None:
                     continue
