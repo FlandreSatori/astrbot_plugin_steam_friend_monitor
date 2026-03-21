@@ -647,6 +647,7 @@ class SteamFriendMonitor(Star):
         game_name: str,
     ):
         key = self._achievement_key(target, sid, gameid)
+        cache_key = self.achievement_monitor._make_key(target, sid, gameid)
         api_key = str(self.config.get("steam_api_key", "")).strip()
         interval_sec = self._achievement_poll_interval_sec()
         try:
@@ -676,7 +677,12 @@ class SteamFriendMonitor(Star):
                         break
                     continue
 
-                new_achievements = set(current) - before
+                current_set = set(current)
+                # 先推进快照，避免在游戏结束取消轮询时，最终补偿检查重复发送已在轮询中识别的新成就。
+                self.achievement_snapshots[key] = list(current_set)
+                self.achievement_monitor.initial_achievements[cache_key] = list(current_set)
+
+                new_achievements = current_set - before
                 if new_achievements:
                     await self._notify_new_achievements(
                         target,
@@ -686,8 +692,6 @@ class SteamFriendMonitor(Star):
                         game_name,
                         new_achievements,
                     )
-                # 更新快照，避免同一批新成就在后续周期中重复推送
-                self.achievement_snapshots[key] = list(current)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -711,7 +715,10 @@ class SteamFriendMonitor(Star):
                 return
 
             api_key = str(self.config.get("steam_api_key", "")).strip()
-            before = set(self.achievement_snapshots.get(key, []))
+            # 最终补偿检查同时参考内存快照与已记录基线，避免重复推送。
+            before_snapshot = set(self.achievement_snapshots.get(key, []))
+            before_persisted = set(self.achievement_monitor.initial_achievements.get(cache_key, []))
+            before = before_snapshot | before_persisted
             current = await self.achievement_monitor.get_player_achievements(
                 api_key,
                 target,
@@ -721,7 +728,8 @@ class SteamFriendMonitor(Star):
             if current is None:
                 return
 
-            new_achievements = set(current) - before
+            current_set = set(current)
+            new_achievements = current_set - before
             if new_achievements:
                 await self._notify_new_achievements(
                     target,
@@ -734,7 +742,8 @@ class SteamFriendMonitor(Star):
             
             # 游戏结束后，将当前成就状态保存到持久化缓存（标记为已推送过）
             # 这样下次玩家再玩此游戏时，就不会因为插件重启而重复推送成就
-            self.achievement_monitor.initial_achievements[cache_key] = list(current)
+            self.achievement_snapshots[key] = list(current_set)
+            self.achievement_monitor.initial_achievements[cache_key] = list(current_set)
             self.achievement_monitor._save_achievements_cache()
         except asyncio.CancelledError:
             pass
