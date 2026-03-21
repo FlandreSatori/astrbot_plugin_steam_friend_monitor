@@ -2278,8 +2278,7 @@ class SteamFriendMonitor(Star):
             player_map = {str(p.get("steamid", "")): p for p in players}
             target_state = self._get_target_player_state(target)
 
-            events: List[str] = []
-            event_types: set[str] = set()
+            events: List[dict] = []
             has_non_steam_game_start = False
             now_dt = datetime.now()
             now = now_dt.isoformat(timespec="seconds")
@@ -2343,14 +2342,18 @@ class SteamFriendMonitor(Star):
                     target_state[sid] = next_record
                     if prev is not None and prev != 0:
                         events.append(
-                            f"{prev_record.get('personaname', sid)}: 下线（接口未返回）"
+                            {
+                                "type": "offline",
+                                "text": f"{prev_record.get('personaname', sid)}: 下线（接口未返回）",
+                            }
                         )
-                        event_types.add("offline")
                     elif prev is not None and prev_game:
                         events.append(
-                            f"{prev_record.get('personaname', sid)}: 关闭游戏《{prev_game}》（接口未返回）"
+                            {
+                                "type": "game_stop",
+                                "text": f"{prev_record.get('personaname', sid)}: 关闭游戏《{prev_game}》（接口未返回）",
+                            }
                         )
-                        event_types.add("game_stop")
                     if prev_gameid:
                         self._schedule_achievement_final_check(
                             target,
@@ -2580,11 +2583,9 @@ class SteamFriendMonitor(Star):
 
                 name = p.get("personaname", "?")
                 if prev == 0 and st != 0 and not suppress_online_event:
-                    events.append(f"{name} 上线")
-                    event_types.add("online")
+                    events.append({"type": "online", "text": f"{name} 上线"})
                 elif prev != 0 and st == 0 and not suppress_offline_event:
-                    events.append(f"{name} 下线")
-                    event_types.add("offline")
+                    events.append({"type": "offline", "text": f"{name} 下线"})
 
                 if st != 0:
                     avatar_url = (
@@ -2593,11 +2594,18 @@ class SteamFriendMonitor(Star):
                     if not prev_game and game:
                         # 判断玩家名和游戏名是否超过20个字符
                         if len(name) + len(game) > 20:
-                            events.append(f"{name} 启动\n《{game}》")
+                            game_start_text = f"{name} 启动\n《{game}》"
                         else:
-                            events.append(f"{name} 启动《{game}》")
-                        event_types.add("game_start")
-                        if self._is_non_steam_game_start(game):
+                            game_start_text = f"{name} 启动《{game}》"
+                        is_non_steam_game_start = self._is_non_steam_game_start(game)
+                        events.append(
+                            {
+                                "type": "game_start",
+                                "text": game_start_text,
+                                "is_non_steam": is_non_steam_game_start,
+                            }
+                        )
+                        if is_non_steam_game_start:
                             has_non_steam_game_start = True
                         if current_gameid:
                             self._spawn_bg_task(
@@ -2617,10 +2625,10 @@ class SteamFriendMonitor(Star):
                         )
                         # 判断玩家名和游戏名是否超过20个字符
                         if len(name) + len(prev_game) > 20:
-                            events.append(f"{name}  结束\n《{prev_game}》 {game_duration}")
+                            game_stop_text = f"{name}  结束\n《{prev_game}》 {game_duration}"
                         else:
-                            events.append(f"{name}  结束《{prev_game}》 {game_duration}")
-                        event_types.add("game_stop")
+                            game_stop_text = f"{name}  结束《{prev_game}》 {game_duration}"
+                        events.append({"type": "game_stop", "text": game_stop_text})
                     elif prev_game and game and prev_game != game:
                         game_duration = self._format_game_duration(
                             prev_game_accum_seconds
@@ -2628,14 +2636,14 @@ class SteamFriendMonitor(Star):
                         )
                         # 判断旧游戏名和游戏名是否超过20个字符（对于切换游戏，检查新游戏名）
                         if len(prev_game) + len(game) > 20:
-                            events.append(
+                            game_switch_text = (
                                 f"{name} 切换游戏\n《{prev_game}》 -> \n《{game}》 {game_duration}"
                             )
                         else:
-                            events.append(
+                            game_switch_text = (
                                 f"{name} 切换游戏\n《{prev_game}》 -> 《{game}》 {game_duration}"
                             )
-                        event_types.add("game_switch")
+                        events.append({"type": "game_switch", "text": game_switch_text})
                         if current_gameid:
                             self._spawn_bg_task(
                                 self._push_game_start_render(
@@ -2674,8 +2682,10 @@ class SteamFriendMonitor(Star):
             if emit_push and events:
                 text_trigger_types = self._status_text_trigger_types()
                 image_trigger_types = self._status_image_trigger_types()
-                send_text = bool(event_types & text_trigger_types)
-                send_image = bool(event_types & image_trigger_types)
+                text_events = [e for e in events if e.get("type") in text_trigger_types]
+                image_events = [e for e in events if e.get("type") in image_trigger_types]
+                send_text = bool(text_events)
+                send_image = bool(image_events)
 
                 # 例外：即使关闭了 game_start 文字触发，也允许非 Steam 游戏启动时推送文字。
                 if (
@@ -2684,12 +2694,17 @@ class SteamFriendMonitor(Star):
                     and has_non_steam_game_start
                     and self._non_steam_game_start_text_exception_enabled()
                 ):
+                    text_events = [
+                        e
+                        for e in events
+                        if e.get("type") == "game_start" and bool(e.get("is_non_steam"))
+                    ]
                     send_text = True
 
                 if not send_text and not send_image:
                     logger.debug(
                         "[steam-monitor] event push skipped by trigger types: "
-                        f"event_types={sorted(event_types)} "
+                        f"event_types={sorted({str(e.get('type', '')) for e in events})} "
                         f"text_trigger_types={sorted(text_trigger_types)} "
                         f"image_trigger_types={sorted(image_trigger_types)}"
                     )
@@ -2714,7 +2729,7 @@ class SteamFriendMonitor(Star):
                 if not send_text and not send_image:
                     return
 
-                text = chr(10).join(events)
+                text = chr(10).join(str(e.get("text", "")) for e in text_events)
                 try:
                     if send_image:
                         ordered_players = self._order_players_by_ids(players, steam_ids)
