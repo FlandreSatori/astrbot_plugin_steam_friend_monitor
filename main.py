@@ -1683,9 +1683,13 @@ class SteamFriendMonitor(Star):
                     )
                     return game_name
                 else:
+                    self._cache_set(
+                        self.profile_game_cache, steamid, "", "profile_game"
+                    )
                     logger.debug(
                         f"[steam-monitor] profile fallback: profile_in_game_header not found steamid={steamid} url={profile_url}"
                     )
+                    return ""
             except Exception as e:
                 logger.debug(
                     f"[steam-monitor] profile fallback parse failed steamid={steamid} url={profile_url}: {e}"
