@@ -1158,6 +1158,9 @@ class SteamFriendMonitor(Star):
                     "personastate": self._safe_int(record.get("personastate", 0), 0),
                     "gameid": str(record.get("gameid", "") or ""),
                     "gameextrainfo": (record.get("gameextrainfo", "") or "").strip(),
+                    "avatarfull": str(record.get("avatarfull", "") or ""),
+                    "avatarmedium": str(record.get("avatarmedium", "") or ""),
+                    "avatar": str(record.get("avatar", "") or ""),
                 }
             )
 
@@ -2308,6 +2311,9 @@ class SteamFriendMonitor(Star):
                         "personastate": 0,
                         "gameid": "",
                         "gameextrainfo": "",
+                        "avatarfull": prev_record.get("avatarfull", ""),
+                        "avatarmedium": prev_record.get("avatarmedium", ""),
+                        "avatar": prev_record.get("avatar", ""),
                         "offline_since": prev_record.get("offline_since", now),
                         "game_start_ts": None,
                         "game_accum_seconds": 0,
@@ -2461,6 +2467,11 @@ class SteamFriendMonitor(Star):
                         if not pending_dt or (now_dt - pending_dt).total_seconds() < flap_suppress_sec:
                             # 候选期内保持在线状态，不触发上下线事件。
                             st = prev_st
+                            # 候选期内保持上一轮游戏展示，避免把非 Steam 游戏误清空。
+                            current_gameid = prev_gameid
+                            game = prev_game
+                            game_start_ts = prev_game_start_ts
+                            offline_since = ""
                             suppress_offline_event = True
                         else:
                             # 超过窗口，确认离线；允许后续通用事件分支发出下线事件。
@@ -2542,6 +2553,9 @@ class SteamFriendMonitor(Star):
                     "personastate": st,
                     "gameid": current_gameid,
                     "gameextrainfo": game,
+                    "avatarfull": str(p.get("avatarfull") or ""),
+                    "avatarmedium": str(p.get("avatarmedium") or ""),
+                    "avatar": str(p.get("avatar") or ""),
                     "offline_since": offline_since,
                     "game_start_ts": game_start_ts,
                     "game_accum_seconds": game_accum_seconds,
@@ -2836,17 +2850,6 @@ class SteamFriendMonitor(Star):
                 event.unified_msg_origin, steam_ids
             )
             if not ordered_players:
-                default_interval = int(self.config.get("poll_interval_sec", 60) or 60)
-                await self._poll_for_target(
-                    event.unified_msg_origin,
-                    steam_ids,
-                    default_interval,
-                    emit_push=False,
-                )
-                ordered_players = self._get_players_from_state_snapshot(
-                    event.unified_msg_origin, steam_ids
-                )
-            if not ordered_players:
                 yield event.plain_result("本地状态为空，请等待下一次自动轮询后重试")
                 return
             ordered_players = self._apply_presence_flap_view_state(
@@ -2911,17 +2914,6 @@ class SteamFriendMonitor(Star):
             ordered_players = self._get_players_from_state_snapshot(
                 event.unified_msg_origin, steam_ids
             )
-            if not ordered_players:
-                default_interval = int(self.config.get("poll_interval_sec", 60) or 60)
-                await self._poll_for_target(
-                    event.unified_msg_origin,
-                    steam_ids,
-                    default_interval,
-                    emit_push=False,
-                )
-                ordered_players = self._get_players_from_state_snapshot(
-                    event.unified_msg_origin, steam_ids
-                )
             if not ordered_players:
                 yield event.plain_result("[steam_monitor_test] 本地状态为空，请等待自动轮询后重试")
                 return
