@@ -1688,7 +1688,7 @@ class SteamFriendMonitor(Star):
                         self.profile_game_cache, steamid, game_name, "profile_game"
                     )
                     logger.debug(
-                        f"[steam-monitor] profile fallback game name resolved steamid={steamid} game={game_name} url={profile_url}"
+                        f"[steam-monitor] profile steamid={steamid} game={game_name} url={profile_url}"
                     )
                     return game_name
                 else:
@@ -1696,12 +1696,12 @@ class SteamFriendMonitor(Star):
                         self.profile_game_cache, steamid, "", "profile_game"
                     )
                     logger.debug(
-                        f"[steam-monitor] profile fallback: profile_in_game_header not found steamid={steamid} url={profile_url}"
+                        f"[steam-monitor] profile_in_game_header not found steamid={steamid} url={profile_url}"
                     )
                     return ""
             except Exception as e:
                 logger.debug(
-                    f"[steam-monitor] profile fallback parse failed steamid={steamid} url={profile_url}: {e}"
+                    f"[steam-monitor] profile  failed steamid={steamid} url={profile_url}: {e}"
                 )
 
         return ""
@@ -1709,12 +1709,10 @@ class SteamFriendMonitor(Star):
     async def _enrich_players_with_profile_game_fallback(
         self, players: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """统一补全非 Steam 游戏名，确保轮询推送与手动状态图显示一致。"""
+        """补全Steam API未返回的游戏名"""
         if not players or not self._profile_game_fallback_enabled():
             return players
 
-        attempted = 0
-        filled = 0
         for p in players:
             st = int(p.get("personastate", 0) or 0)
             game = (p.get("gameextrainfo", "") or "").strip()
@@ -1722,16 +1720,13 @@ class SteamFriendMonitor(Star):
             if st == 0 or game or not sid:
                 continue
 
-            attempted += 1
             fallback_game = await self._get_profile_game_name_fallback(sid)
             if fallback_game:
                 p["gameextrainfo"] = fallback_game
-                filled += 1
+                logger.debug(
+                    f"[steam-monitor] profile fallback game={fallback_game} steamid={sid}\n "
+                )
 
-        if attempted:
-            logger.debug(
-                f"[steam-monitor] profile fallback enrichment attempted={attempted} filled={filled}"
-            )
         return players
 
     def _process_image_bytes(
