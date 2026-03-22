@@ -152,7 +152,6 @@ class SteamFriendMonitor(Star):
         self.http: httpx.AsyncClient | None = None
         self.bytes_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self.icon_url_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
-        self.profile_game_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._game_name_cache: Dict[str, tuple[str, str]] = {}
         self._config_lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task] = set()
@@ -991,11 +990,6 @@ class SteamFriendMonitor(Star):
     def _cache_limit(self, kind: str) -> int:
         if kind == "bytes":
             return max(100, int(self.config.get("cache_max_bytes_items", 512) or 512))
-        if kind == "profile_game":
-            return max(
-                100,
-                int(self.config.get("cache_max_profile_game_items", 1024) or 1024),
-            )
         return max(100, int(self.config.get("cache_max_icon_items", 1024) or 1024))
 
     def _cache_get(self, cache: OrderedDict, key: str):
@@ -1628,14 +1622,13 @@ class SteamFriendMonitor(Star):
         if not page:
             return ""
 
-        # 简单正则提取 profile_in_game_header class 中的内容
-        pattern = re.compile(
+        header_pattern = re.compile(
             r'<(?P<tag>[a-z0-9]+)[^>]*class\s*=\s*["\']?[^"\']*profile_in_game_header[^"\']*["\']?[^>]*>(?P<body>.*?)</\1>',
             re.I | re.S,
         )
 
         with contextlib.suppress(Exception):
-            match = pattern.search(page)
+            match = header_pattern.search(page)
             if match:
                 raw_text = html.unescape(match.group("body"))
                 raw_text = re.sub(r"<[^>]+>", " ", raw_text)
@@ -1650,10 +1643,6 @@ class SteamFriendMonitor(Star):
         steamid = (steamid or "").strip()
         if not steamid:
             return ""
-
-        cached = self._cache_get(self.profile_game_cache, steamid)
-        if cached is not None:
-            return str(cached or "").strip()
 
         profile_urls = [
             f"https://steamcommunity.com/profiles/{steamid}/?l=schinese",
@@ -1677,6 +1666,9 @@ class SteamFriendMonitor(Star):
                 headers=profile_headers,
             )
             if not raw:
+                logger.debug(
+                        f"[steam-monitor] profile get failed url={profile_url}"
+                    )
                 continue
 
             try:
@@ -1684,24 +1676,18 @@ class SteamFriendMonitor(Star):
                 game_name = self._extract_profile_in_game_header_from_html(page)
 
                 if game_name:
-                    self._cache_set(
-                        self.profile_game_cache, steamid, game_name, "profile_game"
-                    )
                     logger.debug(
                         f"[steam-monitor] profile steamid={steamid} game={game_name} url={profile_url}"
                     )
                     return game_name
                 else:
-                    self._cache_set(
-                        self.profile_game_cache, steamid, "", "profile_game"
-                    )
                     logger.debug(
                         f"[steam-monitor] profile_in_game_header not found steamid={steamid} url={profile_url}"
                     )
                     return ""
             except Exception as e:
                 logger.debug(
-                    f"[steam-monitor] profile  failed steamid={steamid} url={profile_url}: {e}"
+                    f"[steam-monitor] profile failed steamid={steamid} url={profile_url}: {e}"
                 )
 
         return ""
