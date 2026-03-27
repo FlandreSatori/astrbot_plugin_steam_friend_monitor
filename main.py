@@ -2746,6 +2746,82 @@ class SteamFriendMonitor(Star):
         sid = (sid or "").strip()
         return sid.isdigit() and len(sid) >= 10
 
+    async def _resolve_vanity_url(self, vanity: str) -> tuple[str | None, str | None]:
+        """通过 ResolveVanityURL 接口将自定义别名解析为 SteamID64。"""
+        api_key = str(self.config.get("steam_api_key", "")).strip()
+        if not api_key:
+            return None, "未配置 steam_api_key，无法解析自定义链接"
+        url = f"{self.STEAM_API_BASE}/ISteamUser/ResolveVanityURL/v1/"
+        try:
+            if not self.http:
+                self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
+            resp = await self.http.get(url, params={"key": api_key, "vanityurl": vanity})
+            resp.raise_for_status()
+            data = resp.json()
+            response = data.get("response", {})
+            if response.get("success") == 1:
+                sid64 = str(response.get("steamid", ""))
+                if self._validate_steam_id64(sid64):
+                    return sid64, None
+                return None, f"API 返回的 SteamID64 无效: {sid64}"
+            return None, f"无法解析自定义链接 '{vanity}': {response.get('message', '未知错误')}"
+        except Exception as e:
+            return None, f"解析自定义链接失败: {e}"
+
+    async def _resolve_to_steam_id64(self, raw: str) -> tuple[str | None, str | None]:
+        """
+        将 SteamID64 / 好友码 / 个人主页链接统一解析为 SteamID64。
+        返回 (steamid64, error_message)，成功时 error_message 为 None。
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return None, "输入为空"
+
+        # 纯数字：17位及以上视为 SteamID64，否则视为好友码
+        if raw.isdigit():
+            if len(raw) >= 17:
+                if self._validate_steam_id64(raw):
+                    return raw, None
+                return None, f"无效的 SteamID64: {raw}"
+            else:
+                STEAM_ID64_BASE = 76561197960265728
+                try:
+                    sid64 = str(int(raw) + STEAM_ID64_BASE)
+                    if self._validate_steam_id64(sid64):
+                        return sid64, None
+                    return None, f"好友码转换结果无效: {sid64}"
+                except Exception:
+                    return None, f"无效的好友码: {raw}"
+
+        # URL 输入：补全协议头
+        url = raw
+        if not url.startswith("http://") and not url.startswith("https://"):
+            if "steamcommunity.com" in url:
+                url = "https://" + url
+            else:
+                return None, "无法识别的格式，请输入 SteamID64、好友码或 Steam 个人主页链接"
+
+        try:
+            parsed = urlparse(url)
+            path = parsed.path.rstrip("/")
+
+            # /profiles/STEAMID64
+            m = re.match(r"^/profiles/(\d+)$", path)
+            if m:
+                sid64 = m.group(1)
+                if self._validate_steam_id64(sid64):
+                    return sid64, None
+                return None, f"链接中的 SteamID64 无效: {sid64}"
+
+            # /id/vanityname
+            m = re.match(r"^/id/([^/]+)$", path)
+            if m:
+                return await self._resolve_vanity_url(m.group(1))
+
+            return None, "无法从链接中提取 SteamID，请确认链接格式"
+        except Exception as e:
+            return None, f"解析链接失败: {e}"
+
     @filter.command("sfm_bind")
     async def bind_group(self, event: AstrMessageEvent):
 
@@ -2792,17 +2868,22 @@ class SteamFriendMonitor(Star):
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
-        steam_id64 = (steam_id64 or "").strip()
-        if not self._validate_steam_id64(steam_id64):
-            yield event.plain_result("SteamID64 格式不正确")
+        raw = (steam_id64 or "").strip()
+        if not raw:
+            yield event.plain_result("请提供 SteamID64、好友码或个人主页链接")
+            return
+
+        resolved, error = await self._resolve_to_steam_id64(raw)
+        if not resolved:
+            yield event.plain_result(f"无法解析输入: {error}")
             return
 
         ids = parse_ids(self.config.get("steam_ids", ""))
-        if steam_id64 not in ids:
-            ids.append(steam_id64)
+        if resolved not in ids:
+            ids.append(resolved)
         await self._update_config_atomic("steam_ids", ",".join(ids))
         yield event.plain_result(
-            f"已绑定 SteamID64: {steam_id64}，当前时间数量: {len(ids)}"
+            f"已绑定 SteamID64: {resolved}，当前时间数量: {len(ids)}"
         )
 
     @filter.command("sfm_del_id")
@@ -3183,18 +3264,31 @@ class SteamFriendMonitor(Star):
         else:
             yield event.plain_result(f"[当前群] 已设置时间ID数量: {len(valid)}")
 
-    @filter.command("sfm_add_group_id")
+        @filter.command("sfm_add_group_id")
     async def add_group_id(self, event: AstrMessageEvent, ids: str):
-        """为当前群添加时间 ID（支持逗号/换行批量）"""
+        """为当前群添加时间 ID（支持逗号/换行批量，兼容好友码和主页链接）"""
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
 
         parsed = parse_ids(ids)
-        valid = [sid for sid in parsed if self._validate_steam_id64(sid)]
-        invalid = [sid for sid in parsed if not self._validate_steam_id64(sid)]
-        if not valid:
+        if not parsed:
             yield event.plain_result("未添加任何有效的 SteamID64")
+            return
+
+        valid: list[str] = []
+        failed: list[str] = []
+        for raw in parsed:
+            sid64, err = await self._resolve_to_steam_id64(raw)
+            if sid64:
+                valid.append(sid64)
+            else:
+                failed.append(f"{raw}({err})")
+
+        if not valid:
+            yield event.plain_result(
+                "未添加任何有效的 SteamID64：\n" + "\n".join(failed[:5])
+            )
             return
 
         group_id = event.unified_msg_origin
@@ -3208,15 +3302,9 @@ class SteamFriendMonitor(Star):
 
         await self._update_group_steam_ids_atomic(group_id, current_ids)
 
-        msg = (
-            f"添加完成：新增 {added} 个，"
-            f"当前时间数量: {len(current_ids)}"
-        )
-        if invalid:
-            msg += (
-                f"；忽略非法ID {len(invalid)} 个："
-                + ", ".join(invalid[:10])
-            )
+        msg = f"添加完成：新增 {added} 个，当前时间数量: {len(current_ids)}"
+        if failed:
+            msg += f"；无法解析 {len(failed)} 个：" + ", ".join(f[:40] for f in failed[:5])
         yield event.plain_result(msg)
 
     @filter.command("sfm_del_group_id")
