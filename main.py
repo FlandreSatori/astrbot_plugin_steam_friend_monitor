@@ -3264,7 +3264,7 @@ class SteamFriendMonitor(Star):
         else:
             yield event.plain_result(f"[当前群] 已设置时间ID数量: {len(valid)}")
 
-        @filter.command("sfm_add_group_id")
+    @filter.command("sfm_add_group_id")
     async def add_group_id(self, event: AstrMessageEvent, ids: str):
         """为当前群添加时间 ID（支持逗号/换行批量，兼容好友码和主页链接）"""
         if not self._is_authorized(event):
@@ -3367,5 +3367,3 @@ class SteamFriendMonitor(Star):
             yield event.plain_result("本群已清除独立配置")
         else:
             yield event.plain_result("本群未设置独立配置")
-
-
