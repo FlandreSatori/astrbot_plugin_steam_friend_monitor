@@ -2892,15 +2892,25 @@ class SteamFriendMonitor(Star):
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
-        steam_id64 = (steam_id64 or "").strip()
+        
+        raw = (steam_id64 or "").strip()
+        if not raw:
+            yield event.plain_result("请提供 SteamID64、好友码或个人主页链接")
+            return
+
+        resolved, error = await self._resolve_to_steam_id64(raw)
+        if not resolved:
+            yield event.plain_result(f"无法解析输入: {error}")
+            return
+        
         ids = parse_ids(self.config.get("steam_ids", ""))
-        if steam_id64 in ids:
-            ids.remove(steam_id64)
-        self.state.pop(steam_id64, None)
+        if resolved in ids:
+            ids.remove(resolved)
+        self.state.pop(resolved, None)
         self._save_state()
         await self._update_config_atomic("steam_ids", ",".join(ids))
         yield event.plain_result(
-            f"已移除 SteamID64: {steam_id64}，当前时间数量: {len(ids)}"
+            f"已移除 SteamID: {resolved}，当前时间数量: {len(ids)}"
         )
 
     @filter.command("sfm_set_ids")
@@ -3308,25 +3318,34 @@ class SteamFriendMonitor(Star):
         yield event.plain_result(msg)
 
     @filter.command("sfm_del_group_id")
-    async def del_group_id(self, event: AstrMessageEvent, steam_id: str):
+    async def del_group_id(self, event: AstrMessageEvent, steam_id64: str):
         """为当前群删除一个时间 ID"""
         if not self._is_authorized(event):
-            yield event.plain_result("无权限")
+            yield event.plain_result("无权限执行该命令")
             return
         
-        steam_id64 = self._resolve_to_steam_id64(steam_id) or ""
+        raw = (steam_id64 or "").strip()
+        if not raw:
+            yield event.plain_result("请提供 SteamID64、好友码或个人主页链接")
+            return
+
+        resolved, error = await self._resolve_to_steam_id64(raw)
+        if not resolved:
+            yield event.plain_result(f"无法解析输入: {error}")
+            return
+        
         group_id = event.unified_msg_origin
         ids = self._get_group_steam_ids(group_id)
         
-        if ids and steam_id64 in ids:
-            ids.remove(steam_id64)
+        if ids and resolved in ids:
+            ids.remove(resolved)
             await self._update_group_steam_ids_atomic(group_id, ids)
             yield event.plain_result(
-                f"[当前群] 已移除 {steam_id64}，当前时间数量: {len(ids)}"
+                f"已从本群移除 {resolved}，当前时间数量: {len(ids)}"
             )
         else:
             yield event.plain_result(
-                "[当前群] 该 SteamID 不在时间列表中，或未为本群单独设置时间"
+                "该 SteamID 不在本群时间列表中"
             )
 
     @filter.command("sfm_group_ids")
