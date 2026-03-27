@@ -3308,13 +3308,13 @@ class SteamFriendMonitor(Star):
         yield event.plain_result(msg)
 
     @filter.command("sfm_del_group_id")
-    async def del_group_id(self, event: AstrMessageEvent, steam_id64: str):
+    async def del_group_id(self, event: AstrMessageEvent, steam_id: str):
         """为当前群删除一个时间 ID"""
         if not self._is_authorized(event):
             yield event.plain_result("无权限")
             return
         
-        steam_id64 = (steam_id64 or "").strip()
+        steam_id64 = self._resolve_to_steam_id64(steam_id) or ""
         group_id = event.unified_msg_origin
         ids = self._get_group_steam_ids(group_id)
         
@@ -3326,7 +3326,7 @@ class SteamFriendMonitor(Star):
             )
         else:
             yield event.plain_result(
-                "[当前群] 该 SteamID64 不在时间列表中，或未为本群单独设置时间"
+                "[当前群] 该 SteamID 不在时间列表中，或未为本群单独设置时间"
             )
 
     @filter.command("sfm_group_ids")
