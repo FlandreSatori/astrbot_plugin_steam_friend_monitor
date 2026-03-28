@@ -21,6 +21,12 @@
     "type": "int",
     "default": 50
   },
+  "cache_ttl_sec": {
+    "description": "网页抓取缓存有效期（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "控制个人主页数据的缓存时间。设置越小更新越及时，但被ban风险越大。强制要求不低于60秒。"
+  },
   "status_image_min_interval_min": {
     "description": "状态图片推送最小间隔（分钟，0 表示不限制）",
     "type": "int",

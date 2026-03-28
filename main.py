@@ -986,7 +986,7 @@ class SteamFriendMonitor(Star):
             )
 
     def _cache_ttl(self) -> int:
-        return max(60, int(self.config.get("cache_ttl_sec", 3600) or 3600))
+        return max(60, int(self.config.get("cache_ttl_sec", 60) or 60))
 
     def _cache_limit(self, kind: str) -> int:
         if kind == "bytes":
