@@ -14,13 +14,13 @@
 
 感谢[steam_status_monitor](https://github.com/Maoer233/astrbot_plugin_steam_status_monitor)插件提供的优美的开始游戏和成就展示方法
 
-![image-20260328161116923](C:\Users\Satori\Documents\FS\workspace\astrbot\AstrBot\data\plugins\astrbot_plugin_steam_friend_monitor\img0)
+![image-20260328161116923](img0)
 
-![image-20260328160704436](C:\Users\Satori\Documents\FS\workspace\astrbot\AstrBot\data\plugins\astrbot_plugin_steam_friend_monitor\img1)
+![image-20260328160704436](img1)
 
-![image-20260328160733510](C:\Users\Satori\Documents\FS\workspace\astrbot\AstrBot\data\plugins\astrbot_plugin_steam_friend_monitor\img2)
+![image-20260328160733510](img2)
 
-![image-20260328160839182](C:\Users\Satori\Documents\FS\workspace\astrbot\AstrBot\data\plugins\astrbot_plugin_steam_friend_monitor\img3)
+![image-20260328160839182](img3)
 
 ## 配置项
 
