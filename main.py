@@ -2992,6 +2992,12 @@ class SteamFriendMonitor(Star):
         steam_ids = group_ids if group_ids is not None else global_ids
         targets = self._get_targets()
 
+        if action in ("emoji"):
+            from .emoji_text import check_svg_support
+            diag_msg = check_svg_support()
+            yield event.plain_result(diag_msg)
+            return
+
         if action in ("cfg", "config"):
             msg = [
                 "[steam_monitor_test: config]",

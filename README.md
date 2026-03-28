@@ -80,7 +80,7 @@
 | 命令 | 参数 | 说明 | 示例 |
 | --- | --- | --- | --- |
 | `/sfm_status` | 无 | 立即拉取并推送当前群聊的状态图 | `/sfm_status` |
-| `/sfm_test` | `action`（可选） | 监控链路测试。可选：`all` `cfg` `config` `status` `pull` `push` | `/sfm_test all` |
+| `/sfm_test` | `action`（可选） | 监控链路测试。可选：`all` `cfg` `config` `status` `pull` `push` `emoji`| `/sfm_test all` |
 | `/steam test_achievement_render` | `steamid gameid [count]` | 成就图片渲染测试（`count` 默认 `3`） | `/steam test_achievement_render 7656... 730 3` |
 | `/steam test_game_start_render` | `steamid gameid` | 开始游戏卡片渲染测试 | `/steam test_game_start_render 7656... 730` |
 
