@@ -4,6 +4,8 @@
 
 - 修复了图片发送的问题，新增了一些实用的配置项。
 
+- 自动记录当前游戏时间/当天游玩时间，可以配置文字/图片推送，兼容emoji姓名
+
 - 和原插件冲突！只能安装一个（尽管原插件好像已经失效）
 
 - [原插件地址](https://github.com/Vince-0906/astrbot_plugin_steam_friend_monitor)
@@ -12,13 +14,15 @@
 
 感谢[steam_status_monitor](https://github.com/Maoer233/astrbot_plugin_steam_status_monitor)插件提供的优美的开始游戏和成就展示方法
 
+![image-20260328161116923](C:\Users\Satori\Documents\FS\workspace\astrbot\AstrBot\data\plugins\astrbot_plugin_steam_friend_monitor\img0)
 
+![image-20260328160704436](C:\Users\Satori\Documents\FS\workspace\astrbot\AstrBot\data\plugins\astrbot_plugin_steam_friend_monitor\img1)
 
+![image-20260328160733510](C:\Users\Satori\Documents\FS\workspace\astrbot\AstrBot\data\plugins\astrbot_plugin_steam_friend_monitor\img2)
 
+![image-20260328160839182](C:\Users\Satori\Documents\FS\workspace\astrbot\AstrBot\data\plugins\astrbot_plugin_steam_friend_monitor\img3)
 
 ## 配置项
-
-以下配置项来自插件配置 schema（`_conf_schema.json`），可在 AstrBot 插件配置页填写。
 
 | 配置键 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -94,10 +98,12 @@
 
 
 
-## 推荐操作
+## 说明
 
 1. 原命令较为繁琐，但考虑到可以在 AstrBot插件 - 管理行为 - 重命名 处添加别名，因此推荐安装后手动添加多个别名。
 
    例如`/sfm_status` -> `/视奸`, `/sfm_add_group_id`-> `/add`
 
-2. 添加的命令可以给予所有人权限，删除只给管理员权限。
+   添加的命令可以给予所有人权限，删除只给管理员权限。
+
+2. /sfm_test emoji 可以查看当前系统是否已经支持emoji渲染。
