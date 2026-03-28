@@ -12,6 +12,7 @@ import httpx
 from PIL import Image, ImageDraw, ImageFont
 
 from astrbot.api import logger
+from .emoji_text import draw_text_with_emoji, measure_text_with_emoji
 
 
 class AchievementMonitor:
@@ -561,7 +562,7 @@ class AchievementMonitor:
         img = Image.new("RGBA", (width, total_height), (20, 26, 33, 255))
         draw = ImageDraw.Draw(img)
 
-        draw.text((padding_h, padding_v), title_text, fill=(255, 255, 255), font=font_title)
+        draw_text_with_emoji(img, draw, (padding_h, padding_v), title_text, fill=(255, 255, 255), font=font_title)
         draw.text(
             (padding_h, padding_v + title_h + title_game_gap),
             game_name,

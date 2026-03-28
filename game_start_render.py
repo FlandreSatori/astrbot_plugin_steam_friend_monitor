@@ -6,6 +6,7 @@ from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import quote
 
 from astrbot.api import logger
+from .emoji_text import draw_text_with_emoji, measure_text_with_emoji
 
 BG_COLOR_TOP = (49, 80, 66)
 BG_COLOR_BOTTOM = (28, 35, 44)
@@ -294,7 +295,7 @@ async def get_playtime_hours(
                 logger.warning(f"[steam-monitor] get playtime failed appid={appid}: {e}")
             if attempt < retry_times - 1:
                 await asyncio.sleep(1)
-        return 0.0
+        return -1.0
     finally:
         if owns_client:
             await client.aclose()
@@ -475,15 +476,15 @@ def render_game_start_image(
             font_bold_tmp = ImageFont.truetype(font_medium, size)
         except Exception:
             font_bold_tmp = ImageFont.load_default()
-        bbox = draw.textbbox((0, 0), player_name, font_bold_tmp)
-        if bbox[2] - bbox[0] <= max_playername_w:
+        measured_w = measure_text_with_emoji(player_name, font_bold_tmp)
+        if measured_w <= max_playername_w:
             player_font_size = size
             break
     try:
         font_bold_final = ImageFont.truetype(font_medium, player_font_size)
     except Exception:
         font_bold_final = ImageFont.load_default()
-    draw.text((text_x + 8, text_y), player_name, font=font_bold_final, fill=(255, 255, 255, 255))
+    draw_text_with_emoji(img, draw, (text_x + 8, text_y), player_name, fill=(255, 255, 255, 255), font=font_bold_final)
 
     # “正在玩”
     draw.text((text_x + 8, text_y + line_height), "正在玩", font=font, fill=(200, 255, 200, 255))

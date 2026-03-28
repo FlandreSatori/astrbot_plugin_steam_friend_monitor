@@ -23,6 +23,7 @@ import httpx
 from PIL import Image, ImageDraw, ImageFont
 
 from .achievement_monitor import AchievementMonitor
+from .emoji_text import draw_text_with_emoji, measure_text_with_emoji
 from .game_start_render import render_game_start
 
 from astrbot.api import AstrBotConfig, logger
@@ -2004,7 +2005,7 @@ class SteamFriendMonitor(Star):
         top = 56
         h = top + row_h * max(1, len(players)) + 20
 
-        img = Image.new("RGB", (w, h), (22, 26, 31))
+        img = Image.new("RGBA", (w, h), (22, 26, 31, 255))
         draw = ImageDraw.Draw(img)
 
         font_text = safe_font(24, self.plugin_dir)
@@ -2040,9 +2041,7 @@ class SteamFriendMonitor(Star):
 
             name_x = 112
             name_y = y + 18
-            draw.text((name_x, name_y), name, fill=(240, 240, 240), font=font_text)
-            name_box = draw.textbbox((0, 0), name, font=font_text)
-            name_w = name_box[2] - name_box[0]
+            name_w = draw_text_with_emoji(img, draw, (name_x, name_y), name, fill=(240, 240, 240), font=font_text)
             line2 = game if game else persona_text(state)
             draw.text((112, y + 54), line2, fill=(170, 180, 190), font=font_small)
 
@@ -2071,7 +2070,7 @@ class SteamFriendMonitor(Star):
             / f"steam_status_{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
         )
         try:
-            img.save(out)
+            img.convert("RGB").save(out)
             return str(out)
         finally:
             img.close()
@@ -2941,7 +2940,7 @@ class SteamFriendMonitor(Star):
         global_ids = parse_ids(self.config.get("steam_ids", ""))
         steam_ids = group_ids if group_ids is not None else global_ids
         if not steam_ids:
-            yield event.plain_result("未配置 steam_ids（当前群无独立配置，且全局也为空）")
+            yield event.plain_result("未配置时间列表")
             return
 
         image_path = None
@@ -2950,7 +2949,7 @@ class SteamFriendMonitor(Star):
                 event.unified_msg_origin, steam_ids
             )
             if not ordered_players:
-                yield event.plain_result("本地状态为空，请等待下一次自动轮询后重试")
+                yield event.plain_result("本地缓存为空，请稍后后重试")
                 return
             ordered_players = self._apply_presence_flap_view_state(
                 ordered_players, event.unified_msg_origin
