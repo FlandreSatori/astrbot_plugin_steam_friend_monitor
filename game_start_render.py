@@ -16,6 +16,29 @@ IMG_W, IMG_H = 512, 192  # 16:6，画布高度减少三分之一
 # 星星素材路径
 STAR_BG_PATH = os.path.join(os.path.dirname(__file__), "star_767x809.png")
 MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
+PLAYTIME_CACHE_TTL_SEC = 7 * 24 * 3600
+_PLAYTIME_CACHE: dict[str, tuple[float, float]] = {}
+
+
+def _playtime_cache_key(steamid: str, appid: str) -> str:
+    return f"{steamid}:{appid}"
+
+
+def _playtime_cache_get(steamid: str, appid: str) -> float | None:
+    key = _playtime_cache_key(str(steamid), str(appid))
+    item = _PLAYTIME_CACHE.get(key)
+    if not item:
+        return None
+    ts, val = item
+    if time.time() - ts > PLAYTIME_CACHE_TTL_SEC:
+        _PLAYTIME_CACHE.pop(key, None)
+        return None
+    return float(val)
+
+
+def _playtime_cache_set(steamid: str, appid: str, hours: float):
+    key = _playtime_cache_key(str(steamid), str(appid))
+    _PLAYTIME_CACHE[key] = (time.time(), float(hours))
 
 
 def _safe_json(resp: httpx.Response) -> dict:
@@ -258,11 +281,11 @@ async def get_playtime_hours(
     api_key,
     steamid,
     appid,
-    retry_times=3,
+    retry_times=1,
     steam_api_base=None,
     client: httpx.AsyncClient | None = None,
 ):
-    """通过 Steam Web API 获取某玩家某游戏的总游玩小时数（异步实现，失败自动重试）"""
+    """通过 Steam Web API 获取总游玩小时数；失败时回退到最近一次成功缓存。"""
     import asyncio
 
     steam_api_base = (steam_api_base or "https://api.steampowered.com").rstrip("/")
@@ -270,20 +293,26 @@ async def get_playtime_hours(
         f"{steam_api_base}/IPlayerService/GetOwnedGames/v1/"
         f"?key={api_key}&steamid={steamid}&include_appinfo=0&appids_filter[0]={appid}"
     )
+    cached_hours = _playtime_cache_get(str(steamid), str(appid))
     owns_client = client is None
     if owns_client:
         client = httpx.AsyncClient(timeout=10, follow_redirects=True)
     try:
         for attempt in range(retry_times):
             try:
-                resp = await client.get(url)
+                resp = await client.get(
+                    url,
+                    timeout=httpx.Timeout(connect=3.0, read=4.0, write=4.0, pool=2.0),
+                )
                 if resp.status_code == 200:
                     data = _safe_json(resp)
                     games = data.get("response", {}).get("games", [])
                     for g in games:
                         if str(g.get("appid")) == str(appid):
                             playtime_min = g.get("playtime_forever", 0)
-                            return round(playtime_min / 60, 1)
+                            hours = round(playtime_min / 60, 1)
+                            _playtime_cache_set(str(steamid), str(appid), hours)
+                            return hours
                     logger.debug(
                         f"[steam-monitor] playtime game not found steamid={steamid} appid={appid}"
                     )
@@ -295,7 +324,13 @@ async def get_playtime_hours(
                 logger.warning(f"[steam-monitor] get playtime failed appid={appid}: {e}")
             if attempt < retry_times - 1:
                 await asyncio.sleep(1)
-        return -1.0
+        if cached_hours is not None:
+            logger.debug(
+                "[steam-monitor] playtime fallback to cache "
+                f"steamid={steamid} appid={appid} hours={cached_hours}"
+            )
+            return cached_hours
+        return "N/A"
     finally:
         if owns_client:
             await client.aclose()
@@ -545,6 +580,7 @@ async def render_game_start(
                 api_key,
                 steamid,
                 gameid,
+                retry_times=1,
                 steam_api_base=steam_api_base,
                 client=client,
             )

@@ -151,6 +151,8 @@ class SteamFriendMonitor(Star):
         )
 
         self.http: httpx.AsyncClient | None = None
+        self._http_lock = asyncio.Lock()
+        self._http_last_reset_ts = 0.0
         self.bytes_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self.icon_url_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._game_name_cache: Dict[str, tuple[str, str]] = {}
@@ -223,9 +225,57 @@ class SteamFriendMonitor(Star):
             font_name = 'NotoSansHans-Medium.otf'
         return self.font_paths.get(font_name) or font_name
 
+    def _build_http_client(self) -> httpx.AsyncClient:
+        timeout = httpx.Timeout(connect=10.0, read=15.0, write=15.0, pool=5.0)
+        limits = httpx.Limits(
+            max_connections=50,
+            max_keepalive_connections=20,
+            keepalive_expiry=30.0,
+        )
+        return httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            limits=limits,
+        )
+
+    async def _ensure_http_client(self) -> httpx.AsyncClient:
+        if self.http is not None:
+            return self.http
+        async with self._http_lock:
+            if self.http is None:
+                self.http = self._build_http_client()
+        return self.http
+
+    async def _reset_http_client(
+        self,
+        reason: str,
+        err: Exception | None = None,
+    ) -> httpx.AsyncClient:
+        now_ts = time.time()
+        async with self._http_lock:
+            if self.http is not None and (now_ts - self._http_last_reset_ts) < 5:
+                return self.http
+
+            old = self.http
+            self.http = self._build_http_client()
+            self._http_last_reset_ts = now_ts
+
+        if old is not None:
+            with contextlib.suppress(Exception):
+                await old.aclose()
+
+        if err is not None:
+            logger.warning(
+                "[steam-monitor] http client reset: "
+                f"reason={reason} err_type={type(err).__name__} err={repr(err)}"
+            )
+        else:
+            logger.warning(f"[steam-monitor] http client reset: reason={reason}")
+        return self.http
+
     async def initialize(self):
         self.achievement_monitor.steam_api_base = self.STEAM_API_BASE
-        self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
+        await self._ensure_http_client()
         self._task = asyncio.create_task(self._poll_loop())
         logger.info(
             "[steam-monitor] runtime: "
@@ -880,14 +930,13 @@ class SteamFriendMonitor(Star):
         name_en = fallback_name or "未知游戏"
 
         try:
-            if not self.http:
-                self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
-            resp_zh = await self.http.get(url_zh)
+            http = await self._ensure_http_client()
+            resp_zh = await http.get(url_zh)
             data_zh = resp_zh.json()
             info_zh = data_zh.get(gid, {}).get("data", {})
             name_zh = info_zh.get("name") or name_zh
 
-            resp_en = await self.http.get(url_en)
+            resp_en = await http.get(url_en)
             data_en = resp_en.json()
             info_en = data_en.get(gid, {}).get("data", {})
             name_en = info_en.get("name") or name_en
@@ -904,9 +953,8 @@ class SteamFriendMonitor(Star):
 
         url = f"{self.STEAM_API_BASE}/ISteamUserStats/GetNumberOfCurrentPlayers/v1/?appid={gid}"
         try:
-            if not self.http:
-                self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
-            resp = await self.http.get(url)
+            http = await self._ensure_http_client()
+            resp = await http.get(url)
             if resp.status_code == 200:
                 data = resp.json()
                 return data.get("response", {}).get("player_count")
@@ -1071,9 +1119,6 @@ class SteamFriendMonitor(Star):
         if not api_key:
             raise RuntimeError("未配置 steam_api_key")
 
-        if not self.http:
-            self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
-
         uniq_ids = _dedup_keep_order(steam_ids)
 
         batch_size = min(
@@ -1090,22 +1135,43 @@ class SteamFriendMonitor(Star):
             
             for attempt in range(max_retries + 1):
                 try:
+                    http = await self._ensure_http_client()
                     summary_api = f"{self.STEAM_API_BASE}/ISteamUser/GetPlayerSummaries/v2/"
-                    r = await self.http.get(summary_api, params=params)
+                    r = await http.get(summary_api, params=params)
                     r.raise_for_status()
                     data = r.json()
                     players.extend(data.get("response", {}).get("players", []))
                     break  # 成功，跳出重试循环
+                except httpx.PoolTimeout as e:
+                    if attempt < max_retries:
+                        logger.warning(
+                            "[steam-monitor] fetch players pool timeout "
+                            f"(attempt {attempt + 1}/{max_retries + 1}): "
+                            f"{type(e).__name__} {repr(e)}"
+                        )
+                        await self._reset_http_client("fetch_players_pool_timeout", e)
+                        await asyncio.sleep(retry_delay * (2 ** attempt))
+                        continue
+                    logger.error(
+                        "[steam-monitor] fetch players failed after "
+                        f"{max_retries + 1} attempts: {type(e).__name__} {repr(e)}"
+                    )
+                    raise RuntimeError(
+                        f"无法连接 Steam API（已重试 {max_retries} 次）：{type(e).__name__}"
+                    ) from e
                 except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
                     if attempt < max_retries:
                         logger.warning(
-                            f"[steam-monitor] fetch players network error (attempt {attempt + 1}/{max_retries + 1}): {e}"
+                            "[steam-monitor] fetch players network error "
+                            f"(attempt {attempt + 1}/{max_retries + 1}): "
+                            f"{type(e).__name__} {repr(e)}"
                         )
                         await asyncio.sleep(retry_delay * (2 ** attempt))  # 指数退避
                         continue
                     else:
                         logger.error(
-                            f"[steam-monitor] fetch players failed after {max_retries + 1} attempts: {e}"
+                            "[steam-monitor] fetch players failed after "
+                            f"{max_retries + 1} attempts: {type(e).__name__} {repr(e)}"
                         )
                         raise RuntimeError(
                             f"无法连接 Steam API（已重试 {max_retries} 次）：{type(e).__name__}"
@@ -1349,9 +1415,6 @@ class SteamFriendMonitor(Star):
                 )
                 return disk_cached
 
-        if not self.http:
-            self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
-
         candidates = [url]
         if proxy_prefix:
             candidates.append(self._with_image_proxy(url, proxy_prefix))
@@ -1379,7 +1442,8 @@ class SteamFriendMonitor(Star):
                     logger.debug(
                         f"[steam-monitor] request hop={hop}/{max_redirects} current={current}"
                     )
-                    async with self.http.stream(
+                    http = await self._ensure_http_client()
+                    async with http.stream(
                         "GET", current, follow_redirects=False, headers=headers
                     ) as resp:
                         logger.debug(
@@ -1477,6 +1541,15 @@ class SteamFriendMonitor(Star):
                         f"[steam-monitor] stop trying current origin after hop={hop} current={current}"
                     )
                     break
+            except httpx.PoolTimeout as e:
+                logger.debug(
+                    f"[steam-monitor] fetch image bytes pool timeout: {origin} "
+                    f"err_type={type(e).__name__} err={repr(e)}"
+                )
+                await self._reset_http_client("fetch_url_bytes_pool_timeout", e)
+                fail_reasons.append(
+                    f"exception:{origin}:{type(e).__name__}:{repr(e)}"
+                )
             except Exception as e:
                 logger.debug(
                     f"[steam-monitor] fetch image bytes failed: {origin} err={e}"
@@ -1562,11 +1635,10 @@ class SteamFriendMonitor(Star):
 
         headers = {"Authorization": f"Bearer {self.SGDB_API_KEY}"}
         try:
-            if not self.http:
-                self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
+            http = await self._ensure_http_client()
 
             game_url = f"{self.SGDB_API_BASE}/api/v2/games/steam/{gid}"
-            resp_game = await self.http.get(game_url, headers=headers)
+            resp_game = await http.get(game_url, headers=headers)
             if resp_game.status_code != 200:
                 return None
             game_data = resp_game.json()
@@ -1581,7 +1653,7 @@ class SteamFriendMonitor(Star):
                 f"{self.SGDB_API_BASE}/api/v2/grids/game/{sgdb_game_id}"
                 "?dimensions=460x215&type=static&limit=1"
             )
-            resp_grid = await self.http.get(grid_url, headers=headers)
+            resp_grid = await http.get(grid_url, headers=headers)
             if resp_grid.status_code != 200:
                 return None
             grid_data = resp_grid.json()
@@ -2752,9 +2824,8 @@ class SteamFriendMonitor(Star):
             return None, "未配置 steam_api_key，无法解析自定义链接"
         url = f"{self.STEAM_API_BASE}/ISteamUser/ResolveVanityURL/v1/"
         try:
-            if not self.http:
-                self.http = httpx.AsyncClient(timeout=15, follow_redirects=True)
-            resp = await self.http.get(url, params={"key": api_key, "vanityurl": vanity})
+            http = await self._ensure_http_client()
+            resp = await http.get(url, params={"key": api_key, "vanityurl": vanity})
             resp.raise_for_status()
             data = resp.json()
             response = data.get("response", {})
