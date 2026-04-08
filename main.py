@@ -3170,8 +3170,20 @@ class SteamFriendMonitor(Star):
                 event.unified_msg_origin, steam_ids
             )
             if not ordered_players:
-                yield event.plain_result("本地缓存为空，请稍后后重试")
-                return
+                logger.debug(
+                    "[steam-monitor] 本地缓存为空，尝试主动拉取状态 "
+                    f"target={group_id} ids={len(steam_ids)}"
+                )
+                await self._poll_for_target(
+                    group_id,
+                    steam_ids,
+                    int(self.config.get("poll_interval_sec", 30) or 30),
+                    emit_push=False,
+                )
+                ordered_players = self._get_players_from_state_snapshot(group_id, steam_ids)
+                if not ordered_players:
+                    yield event.plain_result("本地缓存为空，请稍后重试")
+                    return
             ordered_players = self._apply_presence_flap_view_state(
                 ordered_players, event.unified_msg_origin
             )
@@ -3215,10 +3227,51 @@ class SteamFriendMonitor(Star):
         group_id = event.unified_msg_origin
         steam_ids = self._get_group_steam_ids(group_id) or []
 
-        # 默认等价于 /sfm，从缓存拉取一次状态图。
+        # 默认行为：强制拉取最新状态后渲染，便于排查缓存与轮询问题。
         if not action:
-            async for msg in self.status(event):
-                yield msg
+            if not steam_ids:
+                yield event.plain_result("当前群未配置视奸对象，请先 /sfm_add")
+                return
+
+            image_path = None
+            try:
+                await self._poll_for_target(
+                    group_id,
+                    steam_ids,
+                    int(self.config.get("poll_interval_sec", 60) or 60),
+                    emit_push=False,
+                )
+
+                ordered_players = self._get_players_from_state_snapshot(group_id, steam_ids)
+                if not ordered_players:
+                    yield event.plain_result("已尝试拉取最新状态，但暂无可渲染数据")
+                    return
+
+                ordered_players = self._apply_presence_flap_view_state(
+                    ordered_players, group_id
+                )
+                image_path = await self._render_status_image(ordered_players, group_id)
+                await self._push_image(group_id, "", image_path)
+            except RuntimeError as e:
+                logger.error(f"[steam-monitor] sfm_test force refresh failed: {e}")
+                yield event.plain_result(f"强制拉取状态失败: {str(e)}")
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+                logger.error(f"[steam-monitor] sfm_test network error: {e}")
+                error_msg = (
+                    "网络连接失败，请稍后重试\n"
+                    f"错误类型: {type(e).__name__}\n"
+                    "可能的原因:\n"
+                    "• Steam API 服务暂时不可用\n"
+                    "• 本地网络连接中断\n"
+                    "• DNS 解析失败"
+                )
+                yield event.plain_result(error_msg)
+            except Exception as e:
+                logger.error(f"[steam-monitor] sfm_test force refresh failed: {e}", exc_info=True)
+                yield event.plain_result(f"强制拉取状态失败: {e}")
+            finally:
+                if image_path:
+                    self._schedule_delayed_unlink(image_path, 30)
             return
 
         if action not in ("game_start", "achievement"):
