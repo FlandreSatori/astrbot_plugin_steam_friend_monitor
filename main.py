@@ -400,11 +400,6 @@ class SteamFriendMonitor(Star):
         except Exception as e:
             logger.warning(f"[steam-monitor] save config failed: {e}")
 
-    async def _update_config_atomic(self, key: str, value: str):
-        async with self._config_lock:
-            self.config[key] = value
-            self._save_config_safe()
-
     async def _update_targets_atomic(self, targets: List[str]):
         async with self._config_lock:
             self._set_targets(targets)
@@ -2370,8 +2365,7 @@ class SteamFriendMonitor(Star):
         await asyncio.sleep(3)
         while not self._stop:
             try:
-                # 获取全局 steam_ids 和推送目标
-                global_steam_ids = parse_ids(self.config.get("steam_ids", ""))
+                # 仅按群独立配置轮询，不再使用全局 steam_ids。
                 default_interval = int(self.config.get("poll_interval_sec", 60) or 60)
                 targets = self._get_targets()
 
@@ -2379,7 +2373,7 @@ class SteamFriendMonitor(Star):
                 all_steam_ids: List[str] = []
                 for target in targets:
                     group_ids = self._get_group_steam_ids(target)
-                    steam_ids = group_ids if group_ids is not None else global_steam_ids
+                    steam_ids = group_ids or []
                     normalized_ids = _dedup_keep_order(steam_ids)
                     if not normalized_ids:
                         logger.debug(
@@ -3127,96 +3121,13 @@ class SteamFriendMonitor(Star):
             await self._update_targets_atomic(targets)
         yield event.plain_result("已取消当前会话绑定")
 
-    @filter.command("sfm_targets")
-    async def show_targets(self, event: AstrMessageEvent):
-
-        if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
-            return
-        targets = self._get_targets()
-        if not targets:
-            yield event.plain_result("当前无推送目标，请先 /sfm_bind")
-            return
-        yield event.plain_result("当前推送目标：" + chr(10) + chr(10).join(targets))
-
-    @filter.command("sfm_add_id")
-    async def bind_id(self, event: AstrMessageEvent, steam_id64: str):
-
-        if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
-            return
-        raw = (steam_id64 or "").strip()
-        if not raw:
-            yield event.plain_result("请提供 SteamID64、好友码或个人主页链接")
-            return
-
-        resolved, error = await self._resolve_to_steam_id64(raw)
-        if not resolved:
-            yield event.plain_result(f"无法解析输入: {error}")
-            return
-
-        ids = parse_ids(self.config.get("steam_ids", ""))
-        if resolved not in ids:
-            ids.append(resolved)
-        await self._update_config_atomic("steam_ids", ",".join(ids))
-        yield event.plain_result(
-            f"已绑定 SteamID64: {resolved}，当前时间数量: {len(ids)}"
-        )
-
-    @filter.command("sfm_del_id")
-    async def unbind_id(self, event: AstrMessageEvent, steam_id64: str):
-
-        if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
-            return
-        
-        raw = (steam_id64 or "").strip()
-        if not raw:
-            yield event.plain_result("请提供 SteamID64、好友码或个人主页链接")
-            return
-
-        resolved, error = await self._resolve_to_steam_id64(raw)
-        if not resolved:
-            yield event.plain_result(f"无法解析输入: {error}")
-            return
-        
-        ids = parse_ids(self.config.get("steam_ids", ""))
-        if resolved in ids:
-            ids.remove(resolved)
-        self.state.pop(resolved, None)
-        self._save_state()
-        await self._update_config_atomic("steam_ids", ",".join(ids))
-        yield event.plain_result(
-            f"已移除 SteamID: {resolved}，当前时间数量: {len(ids)}"
-        )
-
-    @filter.command("sfm_set_ids")
-    async def set_ids(self, event: AstrMessageEvent, ids: str):
-
-        if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
-            return
-        parsed = parse_ids(ids)
-        valid = [sid for sid in parsed if self._validate_steam_id64(sid)]
-        invalid = [sid for sid in parsed if not self._validate_steam_id64(sid)]
-        await self._update_config_atomic("steam_ids", ",".join(valid))
-        if invalid:
-            yield event.plain_result(
-                f"已设置时间ID数量: {len(valid)}；忽略非法ID {len(invalid)} 个："
-                + ", ".join(invalid[:10])
-            )
-        else:
-            yield event.plain_result(f"已设置时间ID数量: {len(valid)}")
-
-    @filter.command("sfm_status")
+    @filter.command("sfm")
     async def status(self, event: AstrMessageEvent):
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
         group_id = event.unified_msg_origin
-        group_ids = self._get_group_steam_ids(group_id)
-        global_ids = parse_ids(self.config.get("steam_ids", ""))
-        steam_ids = group_ids if group_ids is not None else global_ids
+        steam_ids = self._get_group_steam_ids(group_id) or []
         if not steam_ids:
             yield event.plain_result("未配置时间列表")
             return
@@ -3258,113 +3169,49 @@ class SteamFriendMonitor(Star):
                 self._schedule_delayed_unlink(image_path, 30)
 
     @filter.command("sfm_test")
-    async def steam_monitor_test(self, event: AstrMessageEvent, action: str = "all"):
+    async def steam_monitor_test(
+        self,
+        event: AstrMessageEvent,
+        action: str = "",
+        gameid: str = "",
+    ):
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
 
-        action = (action or "all").strip().lower()
+        action = (action or "").strip().lower()
         group_id = event.unified_msg_origin
-        group_ids = self._get_group_steam_ids(group_id)
-        global_ids = parse_ids(self.config.get("steam_ids", ""))
-        steam_ids = group_ids if group_ids is not None else global_ids
-        targets = self._get_targets()
+        steam_ids = self._get_group_steam_ids(group_id) or []
 
-        if action in ("emoji"):
-            from .emoji_text import check_svg_support
-            diag_msg = check_svg_support()
-            yield event.plain_result(diag_msg)
+        # 默认等价于 /sfm，从缓存拉取一次状态图。
+        if not action:
+            async for msg in self.status(event):
+                yield msg
             return
 
-        if action in ("cfg", "config"):
-            msg = [
-                "[steam_monitor_test: config]",
-                f"steam_ids_count={len(steam_ids)}",
-                f"steam_ids_source={'group' if group_ids is not None else 'global'}",
-                f"push_targets_count={len(targets)}",
-                f"poll_interval_sec={self.config.get('poll_interval_sec', 60)}",
-                f"steam_api_key_set={'yes' if bool(self.config.get('steam_api_key', '')) else 'no'}",
-            ]
-            yield event.plain_result(chr(10).join(msg))
+        if action not in ("game_start", "achievement"):
+            yield event.plain_result("用法：/sfm_test [game_start|achievement] [gameid]")
             return
 
         if not steam_ids:
-            yield event.plain_result("[steam_monitor_test] 未配置 steam_ids")
+            yield event.plain_result("当前群未配置视奸对象，请先 /sfm_add")
             return
 
-        image_path = None
-        try:
-            ordered_players = self._get_players_from_state_snapshot(
-                event.unified_msg_origin, steam_ids
-            )
-            if not ordered_players:
-                yield event.plain_result("[steam_monitor_test] 本地状态为空，请等待自动轮询后重试")
-                return
-            status_text = chr(10).join(
-                [
-                    f"{p.get('personaname', '?')}: {persona_text(int(p.get('personastate', 0)))}"
-                    + (
-                        f" | {p.get('gameextrainfo', '')}"
-                        if p.get("gameextrainfo")
-                        else ""
-                    )
-                    for p in ordered_players
-                ]
-            )
+        gid = str(gameid or "").strip()
+        if not gid.isdigit():
+            yield event.plain_result("请提供 gameid，例如：/sfm_test game_start 550")
+            return
 
-            if action in ("status", "pull"):
-                yield event.plain_result(
-                    "[steam_monitor_test: status]" + chr(10) + status_text
-                )
-                ordered_players = self._apply_presence_flap_view_state(
-                    ordered_players, event.unified_msg_origin
-                )
-                return
+        sid = steam_ids[0]
+        if action == "game_start":
+            async for msg in self.steam_test_game_start_render(event, sid, int(gid)):
+                yield msg
+            return
+        elif action == "achievement":
+            async for msg in self.steam_test_achievement_render(event, sid, int(gid), 3):
+                yield msg
 
-            image_path = await self._render_status_image(
-                ordered_players, event.unified_msg_origin
-            )
-            await self._push_image(
-                event.unified_msg_origin,
-                "[steam_monitor_test] 状态拉取成功，测试图如下",
-                image_path,
-            )
-
-            if action in ("push", "all"):
-                if not targets:
-                    yield event.plain_result("[steam_monitor_test] 未配置推送目标")
-                else:
-                    ok = 0
-                    for umo in targets:
-                        try:
-                            await self._push_image(
-                                umo, "[steam_monitor_test] 目标会话测试推送", image_path
-                            )
-                            ok += 1
-                        except Exception as e:
-                            logger.error(f"[steam-monitor] test push failed {umo}: {e}", exc_info=True)
-                    yield event.plain_result(
-                        f"[steam_monitor_test] 目标会话测试推送完成: {ok}/{len(targets)}"
-                    )
-        except RuntimeError as e:
-            logger.error(f"[steam-monitor] test failed: {e}")
-            yield event.plain_result(f"[steam_monitor_test] 执行失败: {str(e)}")
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
-            logger.error(f"[steam-monitor] test network error: {e}")
-            error_msg = (
-                "[steam_monitor_test] 网络连接失败\n"
-                f"错误类型: {type(e).__name__}\n"
-                "请检查网络连接或稍后重试"
-            )
-            yield event.plain_result(error_msg)
-        except Exception as e:
-            logger.error(f"[steam-monitor] test failed: {e}", exc_info=True)
-            yield event.plain_result(f"[steam_monitor_test] 执行失败: {e}")
-        finally:
-            if image_path:
-                self._schedule_delayed_unlink(image_path, 30)
-
-    @filter.command("steam test_achievement_render")
+    # removed command: steam test_achievement_render
     async def steam_test_achievement_render(
         self,
         event: AstrMessageEvent,
@@ -3437,7 +3284,7 @@ class SteamFriendMonitor(Star):
             logger.error(f"[steam-monitor] test achievement render failed: {e}", exc_info=True)
             yield event.plain_result(f"成就图片渲染失败: {e}")
 
-    @filter.command("steam test_game_start_render")
+    # removed command: steam test_game_start_render
     async def steam_test_game_start_render(
         self,
         event: AstrMessageEvent,
@@ -3492,72 +3339,7 @@ class SteamFriendMonitor(Star):
             logger.error(f"[steam-monitor] test game start render failed: {e}", exc_info=True)
             yield event.plain_result(f"开始游戏图片渲染失败: {e}")
 
-    @filter.command("sfm_achievement_on")
-    async def achievement_on(self, event: AstrMessageEvent):
-        if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
-            return
-        await self._update_config_atomic("enable_achievement_monitor", True)
-        yield event.plain_result("已开启成就监控")
-
-    @filter.command("sfm_achievement_off")
-    async def achievement_off(self, event: AstrMessageEvent):
-        if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
-            return
-        await self._update_config_atomic("enable_achievement_monitor", False)
-        for t in list(self.achievement_poll_tasks.values()):
-            t.cancel()
-        self.achievement_poll_tasks.clear()
-        for t in list(self.achievement_final_tasks.values()):
-            t.cancel()
-        self.achievement_final_tasks.clear()
-        self.achievement_snapshots.clear()
-        yield event.plain_result("已关闭成就监控，并停止当前成就轮询任务")
-
-    @filter.command("sfm_achievement_status")
-    async def achievement_status(self, event: AstrMessageEvent):
-        if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
-            return
-        lines = [
-            f"enable_achievement_monitor={self._achievement_enabled()}",
-            f"achievement_poll_interval_sec={self._achievement_poll_interval_sec()}",
-            f"achievement_final_check_delay_sec={self._achievement_final_delay_sec()}",
-            f"max_achievement_notifications={self._achievement_max_notify()}",
-            f"active_achievement_poll_tasks={len(self.achievement_poll_tasks)}",
-            f"active_achievement_final_tasks={len(self.achievement_final_tasks)}",
-            f"achievement_blacklist_size={len(self.achievement_monitor.achievement_blacklist)}",
-        ]
-        yield event.plain_result("\n".join(lines))
-
-    @filter.command("sfm_set_group_ids")
-    async def set_group_ids(self, event: AstrMessageEvent, ids: str):
-        """为当前群设置独立的时间 ID"""
-        if not self._is_authorized(event):
-            yield event.plain_result("无权限执行该命令")
-            return
-        
-        group_id = event.unified_msg_origin
-        parsed = parse_ids(ids)
-        valid = [sid for sid in parsed if self._validate_steam_id64(sid)]
-        invalid = [sid for sid in parsed if not self._validate_steam_id64(sid)]
-        
-        await self._update_group_steam_ids_atomic(group_id, valid)
-        
-        if not valid:
-            yield event.plain_result("未设置任何有效的 SteamID")
-            return
-        
-        if invalid:
-            yield event.plain_result(
-                f"[当前群] 已设置时间ID数量: {len(valid)}；忽略非法ID {len(invalid)} 个："
-                + ", ".join(invalid[:10])
-            )
-        else:
-            yield event.plain_result(f"[当前群] 已设置时间ID数量: {len(valid)}")
-
-    @filter.command("sfm_add_group_id")
+    @filter.command("sfm_add")
     async def add_group_id(self, event: AstrMessageEvent, ids: str):
         """为当前群添加时间 ID（支持逗号/换行批量，兼容好友码和主页链接）"""
         if not self._is_authorized(event):
@@ -3600,7 +3382,7 @@ class SteamFriendMonitor(Star):
             msg += f"；无法解析 {len(failed)} 个：" + ", ".join(f[:40] for f in failed[:5])
         yield event.plain_result(msg)
 
-    @filter.command("sfm_del_group_id")
+    @filter.command("sfm_del")
     async def del_group_id(self, event: AstrMessageEvent, steam_id64: str):
         """为当前群删除一个时间 ID"""
         if not self._is_authorized(event):
@@ -3631,41 +3413,19 @@ class SteamFriendMonitor(Star):
                 "该 SteamID 不在本群时间列表中"
             )
 
-    @filter.command("sfm_group_ids")
-    async def show_group_ids(self, event: AstrMessageEvent):
-        """查看当前群的时间 ID 设置"""
-        if not self._is_authorized(event):
-            yield event.plain_result("无权限")
-            return
-        
-        group_id = event.unified_msg_origin
-        group_ids = self._get_group_steam_ids(group_id)
-        
-        if group_ids is None:
-            global_ids = parse_ids(self.config.get("steam_ids", ""))
-            if global_ids:
-                yield event.plain_result(
-                    f"未设置独立时间，使用全局配置({len(global_ids)}个)：\n"
-                    + ",\n".join(global_ids)
-                )
-            else:
-                yield event.plain_result("未设置独立时间，也无全局配置")
-        else:
-            yield event.plain_result(
-                f"群独立时间配置({len(group_ids)}个)：\n"
-                + ",\n".join(group_ids)
-            )
-
-    @filter.command("sfm_clear_group_ids")
+    @filter.command("sfm_clear")
     async def clear_group_ids(self, event: AstrMessageEvent):
-        """清除当前群的独立配置，回到全局配置"""
+        """清除当前群配置（视奸对象 + 启用状态）"""
         if not self._is_authorized(event):
             yield event.plain_result("无权限")
             return
         
         group_id = event.unified_msg_origin
-        if group_id in self.group_configs:
-            await self._update_group_steam_ids_atomic(group_id, [])
-            yield event.plain_result("本群已清除独立配置")
-        else:
-            yield event.plain_result("本群未设置独立配置")
+        await self._update_group_steam_ids_atomic(group_id, [])
+
+        targets = self._get_targets()
+        if group_id in targets:
+            targets.remove(group_id)
+            await self._update_targets_atomic(targets)
+
+        yield event.plain_result("本群配置已清除")

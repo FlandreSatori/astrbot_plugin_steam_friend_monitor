@@ -5,16 +5,11 @@
     "hint": "在 https://steamcommunity.com/dev/apikey 申请",
     "obvious_hint": true
   },
-  "steam_ids": {
-    "description": "全局监控的 SteamID64（英文逗号分隔）",
-    "type": "string",
-    "default": ""
-  },
   "push_targets": {
     "description": "推送目标会话ID（unified_msg_origin，英文逗号分隔）",
     "type": "text",
     "default": "",
-    "hint": "可在群里执行 /steam_monitor_bind 自动写入，或在此手动维护"
+    "hint": "建议通过 /sfm_bind 与 /sfm_unbind 维护，不建议手动编辑"
   },
   "poll_interval_sec": {
     "description": "基础轮询间隔（秒）",
@@ -24,32 +19,50 @@
   "cache_ttl_sec": {
     "description": "网页抓取缓存有效期（秒）",
     "type": "int",
-    "default": 300,
+    "default": 120,
     "hint": "控制个人主页数据的缓存时间。设置越小更新越及时，但被ban风险越大。强制要求不低于60秒。"
   },
   "count_game_duration_online_only": {
     "description": "游戏时长仅统计'在线'状态（关闭则在线/离开/忙碌等非离线状态都统计）",
     "type": "bool",
-    "default": false,
+    "default": true,
     "hint": "开启后仅 persona=在线 时累计游玩时长；关闭后 persona!=离线 且在玩游戏就累计"
   },
   "status_text_trigger_types": {
-    "description": "触发状态文字推送的事件类型（逗号分隔，可多选或留空）",
+    "description": "触发文字推送的事件类型（逗号分隔，可多选或留空）",
     "type": "string",
     "default": "online,game_stop,game_switch",
     "hint": "可选值：online,offline,game_start,game_stop,game_switch；留空表示不因事件自动推送状态文字"
   },
   "status_image_trigger_types": {
-    "description": "触发状态图片推送的事件类型（逗号分隔，可多选或留空）",
+    "description": "触发群视奸图片推送的事件类型（逗号分隔，可多选或留空）",
     "type": "string",
     "default": "",
     "hint": "可选值：online,offline,game_start,game_stop,game_switch；留空表示不因事件自动推送状态图片"
   },
+  "enable_game_start_render": {
+    "description": "是否启用额外的 开始游戏 卡片推送",
+    "type": "bool",
+    "default": true,
+    "hint": "为开始游戏启用更大封面更精美的卡片推送"
+  },
+  "game_start_bg_image": {
+    "description": "游戏开始卡片背景图片文件名（必须放在插件目录或数据目录）",
+    "type": "string",
+    "default": "star_767x809.png",
+    "hint": "可填：star_767x809.png、或其他自定义背景图路径（相对于插件目录或绝对路径）"
+  },
+  "game_start_bg_opacity": {
+    "description": "游戏开始卡片背景图片不透明度（0.0-1.0）",
+    "type": "float",
+    "default": 0.15,
+    "hint": "0.0 完全透明，1.0 完全不透明；建议范围 0.05-0.3"
+  },
   "status_image_min_interval_sec": {
-    "description": "图片最小推送间隔（秒，0 表示不限制）",
+    "description": "所有图片的最小推送间隔（秒，0 表示不限制）",
     "type": "int",
-    "default": 2,
-    "hint": "用于规避高频发送，最大值为10,一般可弃用。"
+    "default": 1,
+    "hint": "会以固定间隔排队发送，最大值为10,一般可弃用。"
   },
   "presence_flap_suppress_min": {
     "description": "上下线抖动抑制窗口（分钟，0 表示不抑制）",
@@ -90,24 +103,6 @@
     "description": "单次最多推送的新成就数量",
     "type": "int",
     "default": 5
-  },
-  "enable_game_start_render": {
-    "description": "是否启用额外的 开始游戏 精美卡片推送",
-    "type": "bool",
-    "default": true,
-    "hint": "同样受状态图片的最小推送间隔与抖动抑制窗口约束"
-  },
-  "game_start_bg_image": {
-    "description": "游戏开始页面背景图片文件名（必须放在插件目录或数据目录）",
-    "type": "string",
-    "default": "star_767x809.png",
-    "hint": "可填：star_767x809.png、或其他自定义背景图路径（相对于插件目录或绝对路径）"
-  },
-  "game_start_bg_opacity": {
-    "description": "游戏开始页面背景图片不透明度（0.0-1.0）",
-    "type": "float",
-    "default": 0.15,
-    "hint": "0.0 完全透明，1.0 完全不透明；建议范围 0.05-0.3"
   },
   "steam_api_base": {
     "description": "Steam API 基础地址",
