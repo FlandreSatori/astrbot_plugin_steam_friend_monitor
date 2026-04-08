@@ -375,12 +375,12 @@ class SteamFriendMonitor(Star):
         tmp.replace(self.group_configs_file)
 
     def _get_group_steam_ids(self, group_id: str) -> List[str] | None:
-        """获取某个群的专属时间 ID，如果未设置则返回 None"""
+        """获取某个群的专属视奸 ID，如果未设置则返回 None"""
         group_id = str(group_id or "").strip()
         return self.group_configs.get(group_id)
 
     def _set_group_steam_ids(self, group_id: str, steam_ids: List[str]):
-        """设置某个群的专属时间 ID"""
+        """设置某个群的专属视奸 ID"""
         group_id = str(group_id or "").strip()
         uniq = _dedup_keep_order(steam_ids)
         if uniq:
@@ -570,7 +570,7 @@ class SteamFriendMonitor(Star):
         if not key:
             return 0.0
 
-        # 新字段：按群独立冷却时间
+        # 新字段：按群独立冷却视奸
         data = self.state.get("_group_last_push_ts", {})
         if isinstance(data, dict):
             with contextlib.suppress(Exception):
@@ -2068,7 +2068,7 @@ class SteamFriendMonitor(Star):
         game_start_ts = record.get("game_start_ts")
         game_accum_seconds = self._safe_int(record.get("game_accum_seconds", 0), 0)
 
-        # 只在可计时状态且有游戏名且已记录开始时间才显示时长
+        # 只在可计时状态且有游戏名且已记录开始视奸才显示时长
         if not self._is_duration_countable_state(st) or not game or game_start_ts is None:
             return ""
 
@@ -2305,7 +2305,7 @@ class SteamFriendMonitor(Star):
         await self.context.send_message(umo, chain)
 
     def _compute_next_interval(self, steam_ids: List[str], default_sec: int) -> int:
-        # 基于完整时间集合（配置 ID + state）计算，而不是仅 API 返回列表
+        # 基于完整视奸集合（配置 ID + state）计算，而不是仅 API 返回列表
         all_ids = _dedup_keep_order(
             sid
             for sid in (steam_ids + list(self.state.keys()))
@@ -2649,7 +2649,7 @@ class SteamFriendMonitor(Star):
                 else:
                     offline_since = ""
 
-                # 计算游戏开始时间
+                # 计算游戏开始视奸
                 game_start_ts = prev_game_start_ts
                 if game and current_countable:
                     if prev_game == game and prev_game_start_ts and prev_countable:
@@ -2734,7 +2734,7 @@ class SteamFriendMonitor(Star):
                         if pending_dt:
                             elapsed = (now_dt - pending_dt).total_seconds()
 
-                        # 窗口内离线后恢复在线：不播报上下线；若恢复同款游戏则延续原开始时间
+                        # 窗口内离线后恢复在线：不播报上下线；若恢复同款游戏则延续原开始视奸
                         if elapsed is not None and elapsed < flap_suppress_sec:
                             suppress_online_event = True
                             if (
@@ -3093,6 +3093,38 @@ class SteamFriendMonitor(Star):
         except Exception as e:
             return None, f"解析链接失败: {e}"
 
+    @filter.command("sfm_help")
+    async def sfm_help(self, event: AstrMessageEvent):
+        """查看 Steam 好友监控命令帮助"""
+        help_text = (
+            "Steam 好友监控命令帮助\n"
+            "\n"
+            "/sfm_help\n"
+            "  查看本帮助\n"
+            "\n"
+            "/sfm\n"
+            "  从缓存拉取当前会话状态图\n"
+            "\n"
+            "/sfm_bind\n"
+            "  为当前会话启用插件推送\n"
+            "\n"
+            "/sfm_unbind\n"
+            "  为当前会话取消启用\n"
+            "\n"
+            "/sfm_add <链接/好友码/SteamID64>\n"
+            "  为当前会话添加监控对象（支持逗号/换行批量）\n"
+            "\n"
+            "/sfm_del <链接/好友码/SteamID64>\n"
+            "  为当前会话删除一个监控对象\n"
+            "\n"
+            "/sfm_clear\n"
+            "  清除当前会话配置\n"
+            "\n"
+            "/sfm_test [game_start|achievement] [gameid]\n"
+            "  测试渲染卡片（使用当前会话第一个监控对象）"
+        )
+        yield event.plain_result(help_text)
+
     @filter.command("sfm_bind")
     async def bind_group(self, event: AstrMessageEvent):
 
@@ -3129,7 +3161,7 @@ class SteamFriendMonitor(Star):
         group_id = event.unified_msg_origin
         steam_ids = self._get_group_steam_ids(group_id) or []
         if not steam_ids:
-            yield event.plain_result("未配置时间列表")
+            yield event.plain_result("未配置视奸列表")
             return
 
         image_path = None
@@ -3341,7 +3373,7 @@ class SteamFriendMonitor(Star):
 
     @filter.command("sfm_add")
     async def add_group_id(self, event: AstrMessageEvent, ids: str):
-        """为当前群添加时间 ID（支持逗号/换行批量，兼容好友码和主页链接）"""
+        """为当前群添加视奸 ID（支持逗号/换行批量，兼容好友码和主页链接）"""
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
@@ -3377,14 +3409,14 @@ class SteamFriendMonitor(Star):
 
         await self._update_group_steam_ids_atomic(group_id, current_ids)
 
-        msg = f"添加完成：新增 {added} 个，当前时间数量: {len(current_ids)}"
+        msg = f"添加完成：新增 {added} 个，当前视奸数量: {len(current_ids)}"
         if failed:
             msg += f"；无法解析 {len(failed)} 个：" + ", ".join(f[:40] for f in failed[:5])
         yield event.plain_result(msg)
 
     @filter.command("sfm_del")
     async def del_group_id(self, event: AstrMessageEvent, steam_id64: str):
-        """为当前群删除一个时间 ID"""
+        """为当前群删除一个视奸 ID"""
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
@@ -3406,11 +3438,11 @@ class SteamFriendMonitor(Star):
             ids.remove(resolved)
             await self._update_group_steam_ids_atomic(group_id, ids)
             yield event.plain_result(
-                f"已从本群移除 {resolved}，当前时间数量: {len(ids)}"
+                f"已从本群移除 {resolved}，当前视奸数量: {len(ids)}"
             )
         else:
             yield event.plain_result(
-                "该 SteamID 不在本群时间列表中"
+                "该 SteamID 不在本群视奸列表中"
             )
 
     @filter.command("sfm_clear")
