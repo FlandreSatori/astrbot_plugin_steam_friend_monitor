@@ -1200,6 +1200,14 @@ class SteamFriendMonitor(Star):
         self.config["push_targets"] = ",".join(uniq)
         self._save_config_safe()
 
+    async def _clear_group_config(self, group_id: str):
+        """清空会话的视奸列表并取消绑定。"""
+        await self._update_group_steam_ids_atomic(group_id, [])
+        targets = self._get_targets()
+        if group_id in targets:
+            targets.remove(group_id)
+            await self._update_targets_atomic(targets)
+
     async def _fetch_players(self, steam_ids: List[str]) -> List[Dict[str, Any]]:
         """获取玩家数据，带重试机制"""
         api_key = self.config.get("steam_api_key", "")
@@ -2473,6 +2481,7 @@ class SteamFriendMonitor(Star):
             flap_suppress_sec = self._presence_flap_suppress_min() * 60
             for sid in steam_ids:
                 suppress_game_start_render = False
+                prev_game_duration_end_dt = now_dt
                 p = player_map.get(sid)
                 if p is None:
                     prev_record = target_state.get(sid, {})
@@ -2697,6 +2706,8 @@ class SteamFriendMonitor(Star):
                             # 超过窗口，确认离线；允许后续通用事件分支发出下线事件。
                             if pending_prev_game:
                                 pending_end = pending_dt or now_dt
+                                if pending_end < prev_game_duration_end_dt:
+                                    prev_game_duration_end_dt = pending_end
                                 daily_game_seconds += pending_prev_game_accum_seconds
                                 daily_game_seconds += self._session_seconds_in_current_cycle(
                                     pending_prev_game_start_ts,
@@ -2716,6 +2727,8 @@ class SteamFriendMonitor(Star):
                         else:
                             if pending_prev_game:
                                 pending_end = pending_dt or now_dt
+                                if pending_end < prev_game_duration_end_dt:
+                                    prev_game_duration_end_dt = pending_end
                                 daily_game_seconds += pending_prev_game_accum_seconds
                                 daily_game_seconds += self._session_seconds_in_current_cycle(
                                     pending_prev_game_start_ts,
@@ -2750,6 +2763,8 @@ class SteamFriendMonitor(Star):
                             elif pending_prev_game:
                                 # 窗口内恢复但不是同款游戏：按下线时刻结算上一局，避免时长丢失。
                                 pending_end = pending_dt or now_dt
+                                if pending_end < prev_game_duration_end_dt:
+                                    prev_game_duration_end_dt = pending_end
                                 daily_game_seconds += pending_prev_game_accum_seconds
                                 daily_game_seconds += self._session_seconds_in_current_cycle(
                                     pending_prev_game_start_ts,
@@ -2792,6 +2807,8 @@ class SteamFriendMonitor(Star):
                         game_accum_seconds = game_flap_prev_game_accum_seconds
                     elif pending_game_dt:
                         # 超出窗口仍未恢复同款游戏，确认关闭并在此一次性结算上一局。
+                        if pending_game_dt < prev_game_duration_end_dt:
+                            prev_game_duration_end_dt = pending_game_dt
                         daily_game_seconds += game_flap_prev_game_accum_seconds
                         daily_game_seconds += self._session_seconds_in_current_cycle(
                             game_flap_prev_game_start_ts,
@@ -2857,7 +2874,7 @@ class SteamFriendMonitor(Star):
                 if prev_game and not game and not suppress_game_stop_event:
                     game_duration = self._format_game_duration(
                         prev_game_accum_seconds
-                        + self._session_seconds_total(prev_game_start_ts, now_dt)
+                        + self._session_seconds_total(prev_game_start_ts, prev_game_duration_end_dt)
                     )
                     # 判断玩家名和游戏名是否超过20个字符
                     if len(name) + len(prev_game) > 20:
@@ -2910,7 +2927,7 @@ class SteamFriendMonitor(Star):
                     elif prev_game and game and prev_game != game:
                         game_duration = self._format_game_duration(
                             prev_game_accum_seconds
-                            + self._session_seconds_total(prev_game_start_ts, now_dt)
+                            + self._session_seconds_total(prev_game_start_ts, prev_game_duration_end_dt)
                         )
                         # 判断旧游戏名和游戏名是否超过20个字符（对于切换游戏，检查新游戏名）
                         if len(prev_game) + len(game) > 20:
@@ -3146,12 +3163,9 @@ class SteamFriendMonitor(Star):
         if not self._is_authorized(event):
             yield event.plain_result("无权限执行该命令")
             return
-        umo = event.unified_msg_origin
-        targets = self._get_targets()
-        if umo in targets:
-            targets.remove(umo)
-            await self._update_targets_atomic(targets)
-        yield event.plain_result("已取消当前会话绑定")
+        group_id = event.unified_msg_origin
+        await self._clear_group_config(group_id)
+        yield event.plain_result("已取消当前会话绑定，并清除配置")
 
     @filter.command("sfm")
     async def status(self, event: AstrMessageEvent):
@@ -3431,6 +3445,12 @@ class SteamFriendMonitor(Star):
             yield event.plain_result("无权限执行该命令")
             return
 
+        group_id = event.unified_msg_origin
+        targets = self._get_targets()
+        if group_id not in targets:
+            yield event.plain_result("当前会话未启用推送，请先执行 /sfm_bind")
+            return
+
         parsed = parse_ids(ids)
         if not parsed:
             yield event.plain_result("未添加任何有效的 SteamID64")
@@ -3451,7 +3471,6 @@ class SteamFriendMonitor(Star):
             )
             return
 
-        group_id = event.unified_msg_origin
         current_ids = self._get_group_steam_ids(group_id) or []
 
         added = 0
@@ -3506,11 +3525,6 @@ class SteamFriendMonitor(Star):
             return
         
         group_id = event.unified_msg_origin
-        await self._update_group_steam_ids_atomic(group_id, [])
-
-        targets = self._get_targets()
-        if group_id in targets:
-            targets.remove(group_id)
-            await self._update_targets_atomic(targets)
+        await self._clear_group_config(group_id)
 
         yield event.plain_result("本群配置已清除")
