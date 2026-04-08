@@ -3059,11 +3059,29 @@ class SteamFriendMonitor(Star):
     async def _resolve_to_steam_id64(self, raw: str) -> tuple[str | None, str | None]:
         """
         将 SteamID64 / 好友码 / 个人主页链接统一解析为 SteamID64。
+        若以上规则均不匹配，则按 vanityname 处理（等价于 /id/<vanityname>）。
         返回 (steamid64, error_message)，成功时 error_message 为 None。
         """
         raw = (raw or "").strip()
         if not raw:
             return None, "输入为空"
+
+        def _looks_like_url_input(text: str) -> bool:
+            t = (text or "").strip().lower()
+            if not t:
+                return False
+            if t.startswith(("http://", "https://")):
+                return True
+            if "://" in t:
+                return True
+            if "steamcommunity.com" in t:
+                return True
+            if "/" in t or "\\" in t:
+                return True
+            # 形如 example.com 的域名样式也视为网址输入
+            if "." in t and " " not in t:
+                return True
+            return False
 
         # 纯数字：17位及以上视为 SteamID64，否则视为好友码
         if raw.isdigit():
@@ -3087,7 +3105,10 @@ class SteamFriendMonitor(Star):
             if "steamcommunity.com" in url:
                 url = "https://" + url
             else:
-                return None, "无法识别的格式，请输入 SteamID64、好友码或 Steam 个人主页链接"
+                # 仅当输入不像网址时，按 vanityname 解析
+                if not _looks_like_url_input(raw):
+                    return await self._resolve_vanity_url(raw)
+                return None, "无法识别的链接格式，请输入 SteamID64、好友码或 Steam 个人主页链接"
 
         try:
             parsed = urlparse(url)
@@ -3106,7 +3127,7 @@ class SteamFriendMonitor(Star):
             if m:
                 return await self._resolve_vanity_url(m.group(1))
 
-            return None, "无法从链接中提取 SteamID，请确认链接格式"
+            return None, "无法从链接中提取 SteamID，请确认链接格式）"
         except Exception as e:
             return None, f"解析链接失败: {e}"
 
