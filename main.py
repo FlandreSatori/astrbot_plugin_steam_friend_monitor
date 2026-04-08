@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 import uuid
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List
 from urllib.parse import quote, urljoin, urlparse
 
@@ -156,7 +157,13 @@ class SteamFriendMonitor(Star):
         self.bytes_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self.icon_url_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._game_name_cache: Dict[str, tuple[str, str]] = {}
+        self._game_online_count_cache: OrderedDict[str, tuple[float, int]] = OrderedDict()
         self._config_lock = asyncio.Lock()
+        self._image_push_lock = asyncio.Lock()
+        self._image_push_queues: Dict[str, asyncio.Queue[dict[str, Any]]] = {}
+        self._image_push_workers: Dict[str, asyncio.Task] = {}
+        self._state_lock = Lock()
+        self._state_dirty = False
         self._bg_tasks: set[asyncio.Task] = set()
         self.achievement_monitor = AchievementMonitor(self.data_dir)
         self.achievement_poll_tasks: Dict[tuple[str, str, str], asyncio.Task] = {}
@@ -305,6 +312,11 @@ class SteamFriendMonitor(Star):
             t.cancel()
         self._bg_tasks.clear()
 
+        for t in list(self._image_push_workers.values()):
+            t.cancel()
+        self._image_push_workers.clear()
+        self._image_push_queues.clear()
+
         for t in list(self.achievement_poll_tasks.values()):
             t.cancel()
         self.achievement_poll_tasks.clear()
@@ -329,12 +341,21 @@ class SteamFriendMonitor(Star):
             logger.warning(f"[steam-monitor] load state failed: {e}")
             return {}
 
+    def _mark_state_dirty(self):
+        self._state_dirty = True
+
     def _save_state(self):
+        if not self._state_dirty:
+            return
         tmp = self.state_file.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        tmp.replace(self.state_file)
+        with self._state_lock:
+            if not self._state_dirty:
+                return
+            tmp.write_text(
+                json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(self.state_file)
+            self._state_dirty = False
 
     def _load_group_configs(self) -> Dict[str, List[str]]:
         if not self.group_configs_file.exists():
@@ -388,11 +409,78 @@ class SteamFriendMonitor(Star):
         async with self._config_lock:
             self._set_targets(targets)
 
-    def _status_image_min_interval_min(self) -> int:
-        return max(
-            0,
-            int(self.config.get("status_image_min_interval_min", 0) or 0),
+    def _image_push_min_interval_sec(self) -> int:
+        raw_value = self.config.get("status_image_min_interval_sec")
+        return max(0, min(10, int(raw_value or 0)))
+
+    def _get_image_push_queue(self, target: str) -> asyncio.Queue[dict[str, Any]]:
+        key = self._normalize_target_key(target)
+        queue = self._image_push_queues.get(key)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._image_push_queues[key] = queue
+        return queue
+
+    def _ensure_image_push_worker(self, target: str) -> asyncio.Task:
+        key = self._normalize_target_key(target)
+        worker = self._image_push_workers.get(key)
+        if worker is not None and not worker.done():
+            return worker
+
+        worker = asyncio.create_task(self._image_push_worker(key))
+        self._image_push_workers[key] = worker
+        worker.add_done_callback(lambda t, k=key: self._image_push_workers.pop(k, None))
+        return worker
+
+    def _enqueue_image_push(
+        self,
+        target: str,
+        text: str,
+        image_path: str,
+        cleanup_image: bool = True,
+    ):
+        queue = self._get_image_push_queue(target)
+        queue.put_nowait(
+            {
+                "text": text,
+                "image_path": image_path,
+                "cleanup_image": cleanup_image,
+            }
         )
+        self._ensure_image_push_worker(target)
+
+    async def _image_push_worker(self, target: str):
+        queue = self._get_image_push_queue(target)
+        try:
+            while not self._stop:
+                job = await queue.get()
+                image_path = str(job.get("image_path", "") or "")
+                cleanup_image = bool(job.get("cleanup_image", True))
+                try:
+                    min_interval_sec = self._image_push_min_interval_sec()
+                    if min_interval_sec > 0:
+                        async with self._image_push_lock:
+                            last_push_ts = self._get_target_last_push_ts(target)
+                        if last_push_ts > 0:
+                            delay_sec = min_interval_sec - (time.time() - last_push_ts)
+                            if delay_sec > 0:
+                                await asyncio.sleep(delay_sec)
+
+                    await self._push_image(target, str(job.get("text", "") or ""), image_path)
+                    async with self._image_push_lock:
+                        self._set_target_last_push_ts(target, time.time())
+                    self._save_state()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"[steam-monitor] image push worker failed target={target}: {e}")
+                finally:
+                    queue.task_done()
+                    if cleanup_image and image_path:
+                        with contextlib.suppress(Exception):
+                            Path(image_path).unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            pass
 
     def _presence_flap_suppress_min(self) -> int:
         return max(
@@ -510,6 +598,7 @@ class SteamFriendMonitor(Star):
             data = {}
             self.state["_group_last_push_ts"] = data
         data[key] = float(ts)
+        self._mark_state_dirty()
 
     def _get_target_player_state(self, target: str) -> Dict[str, Any]:
         """获取按群隔离的玩家状态快照，用于事件判定。"""
@@ -518,11 +607,13 @@ class SteamFriendMonitor(Star):
         if not isinstance(all_target_state, dict):
             all_target_state = {}
             self.state["_target_player_state"] = all_target_state
+            self._mark_state_dirty()
 
         one_target_state = all_target_state.get(key)
         if not isinstance(one_target_state, dict):
             one_target_state = {}
             all_target_state[key] = one_target_state
+            self._mark_state_dirty()
         return one_target_state
 
     async def _is_host_resolved_private(self, host: str) -> bool:
@@ -951,13 +1042,20 @@ class SteamFriendMonitor(Star):
         if not gid:
             return None
 
+        cached = self._cache_get(self._game_online_count_cache, gid)
+        if cached is not None:
+            return cached
+
         url = f"{self.STEAM_API_BASE}/ISteamUserStats/GetNumberOfCurrentPlayers/v1/?appid={gid}"
         try:
             http = await self._ensure_http_client()
             resp = await http.get(url)
             if resp.status_code == 200:
                 data = resp.json()
-                return data.get("response", {}).get("player_count")
+                player_count = data.get("response", {}).get("player_count")
+                if player_count is not None:
+                    self._cache_set(self._game_online_count_cache, gid, int(player_count), "icon")
+                return player_count
         except Exception as e:
             logger.debug(f"[steam-monitor] get online count failed gameid={gid}: {e}")
         return None
@@ -1012,6 +1110,7 @@ class SteamFriendMonitor(Star):
                 steam_api_base=self.STEAM_API_BASE,
                 bg_image_path=bg_image_path,
                 bg_opacity=bg_opacity,
+                client=await self._ensure_http_client(),
             )
             with tempfile.NamedTemporaryFile(
                 delete=False,
@@ -1020,14 +1119,7 @@ class SteamFriendMonitor(Star):
             ) as tmp:
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
-
-            chain = MessageChain()
-            chain.chain = [
-                # Comp.Plain(text=f"{player_name} 启动 {zh_game_name}"),
-                Comp.Image.fromFileSystem(tmp_path),
-            ]
-            await self.context.send_message(target, chain)
-            self._schedule_delayed_unlink(tmp_path, 30)
+            self._enqueue_image_push(target, "", tmp_path)
         except Exception as e:
             logger.warning(
                 f"[steam-monitor] push game start render failed sid={sid} gameid={gameid}: {e}"
@@ -1189,21 +1281,7 @@ class SteamFriendMonitor(Star):
         player_map = {str(p.get("steamid", "")): p for p in players}
 
         ordered = [player_map[sid] for sid in desired if sid in player_map]
-
-        desired_set = set(desired)
-        rest = [
-            p
-            for p in players
-            if str(p.get("steamid", "")) not in desired_set
-        ]
-        rest.sort(
-            key=lambda p: (
-                str(p.get("personaname", "")).lower(),
-                str(p.get("steamid", "")),
-            )
-        )
-
-        return ordered + rest
+        return ordered
 
     def _get_players_from_state_snapshot(
         self, target: str, steam_ids: List[str]
@@ -2238,11 +2316,36 @@ class SteamFriendMonitor(Star):
             for sid in (steam_ids + list(self.state.keys()))
             if not (isinstance(sid, str) and sid.startswith("_"))
         )
+        all_target_state = self.state.get("_target_player_state", {})
 
         any_online = False
         offline_minutes_max = 0.0
         for sid in all_ids:
-            record = self.state.get(sid, {})
+            record: Dict[str, Any] = {}
+
+            # 优先从按群隔离状态中取该玩家的最新快照。
+            if isinstance(all_target_state, dict):
+                latest_record: Dict[str, Any] | None = None
+                latest_ts = ""
+                for one_target_state in all_target_state.values():
+                    if not isinstance(one_target_state, dict):
+                        continue
+                    one_record = one_target_state.get(sid, {})
+                    if not isinstance(one_record, dict) or not one_record:
+                        continue
+                    ts = str(one_record.get("ts", "") or "")
+                    if latest_record is None or ts > latest_ts:
+                        latest_record = one_record
+                        latest_ts = ts
+                if latest_record is not None:
+                    record = latest_record
+
+            # 兼容旧状态字段。
+            if not record:
+                legacy_record = self.state.get(sid, {})
+                if isinstance(legacy_record, dict):
+                    record = legacy_record
+
             if not isinstance(record, dict):
                 continue
             st = int(record.get("personastate", 0) or 0)
@@ -2272,33 +2375,58 @@ class SteamFriendMonitor(Star):
                 default_interval = int(self.config.get("poll_interval_sec", 60) or 60)
                 targets = self._get_targets()
 
-                if not global_steam_ids and not any(
-                    self._get_group_steam_ids(target) for target in targets
-                ):
+                target_specs: List[tuple[str, List[str]]] = []
+                all_steam_ids: List[str] = []
+                for target in targets:
+                    group_ids = self._get_group_steam_ids(target)
+                    steam_ids = group_ids if group_ids is not None else global_steam_ids
+                    normalized_ids = _dedup_keep_order(steam_ids)
+                    if not normalized_ids:
+                        logger.debug(
+                            f"[steam-monitor] skip poll for target={target} (no steam_ids)"
+                        )
+                        continue
+                    target_specs.append((target, normalized_ids))
+                    all_steam_ids.extend(normalized_ids)
+
+                if not target_specs:
                     await asyncio.sleep(max(30, default_interval))
                     continue
 
-                # 为每个 target 单独处理一次（需要使用其对应的 steam_ids）
-                for target in targets:
+                all_steam_ids = _dedup_keep_order(all_steam_ids)
+
+                try:
+                    players_snapshot = await self._fetch_players(all_steam_ids)
+                    players_snapshot = await self._enrich_players_with_profile_game_fallback(
+                        players_snapshot
+                    )
+                    player_map = {
+                        str(p.get("steamid", "")): p for p in players_snapshot
+                    }
+                except Exception as e:
+                    logger.error(f"[steam-monitor] shared fetch for targets failed: {e}")
+                    await asyncio.sleep(30)
+                    continue
+
+                # 为每个 target 单独处理一次，但共享同一份玩家快照
+                for target, steam_ids in target_specs:
                     try:
-                        # 获取该 target 对应的 steam_ids，优先使用群级别，否则用全局
-                        group_ids = self._get_group_steam_ids(target)
-                        steam_ids = group_ids if group_ids is not None else global_steam_ids
-
-                        if not steam_ids:
-                            logger.debug(
-                                f"[steam-monitor] skip poll for target={target} (no steam_ids)"
-                            )
-                            continue
-
-                        await self._poll_for_target(target, steam_ids, default_interval)
+                        await self._poll_for_target(
+                            target,
+                            steam_ids,
+                            default_interval,
+                            players=players_snapshot,
+                            player_map=player_map,
+                        )
                     except Exception as e:
                         logger.error(
                             f"[steam-monitor] poll for target {target} failed: {e}"
                         )
 
+                self._save_state()
+
                 next_sleep = self._compute_next_interval(
-                    global_steam_ids, default_interval
+                    all_steam_ids, default_interval
                 )
                 logger.debug(f"[steam-monitor] next poll in {next_sleep}s")
                 await asyncio.sleep(next_sleep)
@@ -2330,13 +2458,16 @@ class SteamFriendMonitor(Star):
         steam_ids: List[str],
         default_interval: int,
         emit_push: bool = True,
+        players: List[Dict[str, Any]] | None = None,
+        player_map: Dict[str, Dict[str, Any]] | None = None,
     ):
         """为单个 target 执行一次轮询"""
         image_path = None
         try:
-            players = await self._fetch_players(steam_ids)
-            players = await self._enrich_players_with_profile_game_fallback(players)
-            player_map = {str(p.get("steamid", "")): p for p in players}
+            if players is None or player_map is None:
+                players = await self._fetch_players(steam_ids)
+                players = await self._enrich_players_with_profile_game_fallback(players)
+                player_map = {str(p.get("steamid", "")): p for p in players}
             target_state = self._get_target_player_state(target)
 
             events: List[dict] = []
@@ -2347,6 +2478,7 @@ class SteamFriendMonitor(Star):
             cycle_start = self._daily_cycle_start_utc8(now_dt)
             flap_suppress_sec = self._presence_flap_suppress_min() * 60
             for sid in steam_ids:
+                suppress_game_start_render = False
                 p = player_map.get(sid)
                 if p is None:
                     prev_record = target_state.get(sid, {})
@@ -2384,7 +2516,7 @@ class SteamFriendMonitor(Star):
                         "daily_cycle_key": cycle_key,
                         "daily_game_seconds": daily_game_seconds,
                         "presence_flap_offline_since": prev_record.get(
-                            "presence_flap_offline_since", now
+                            "presence_flap_offline_since", ""
                         ),
                         "presence_flap_prev_game": prev_record.get(
                             "presence_flap_prev_game", prev_game
@@ -2401,6 +2533,8 @@ class SteamFriendMonitor(Star):
                         "missing": True,
                     }
                     target_state[sid] = next_record
+                    if prev_record != next_record:
+                        self._mark_state_dirty()
                     if prev is not None and prev != 0:
                         events.append(
                             {
@@ -2428,6 +2562,7 @@ class SteamFriendMonitor(Star):
                 st = int(p.get("personastate", 0))
                 current_gameid = str(p.get("gameid", "") or "").strip()
                 game = (p.get("gameextrainfo", "") or "").strip()
+                raw_game = game
 
                 prev_record = target_state.get(sid, {})
                 prev = prev_record.get("personastate")
@@ -2453,6 +2588,15 @@ class SteamFriendMonitor(Star):
                 )
                 pending_confirmed = bool(prev_record.get("presence_flap_confirmed", False))
 
+                game_flap_since = str(prev_record.get("game_flap_since", "") or "")
+                game_flap_prev_game = str(prev_record.get("game_flap_prev_game", "") or "")
+                game_flap_prev_gameid = str(prev_record.get("game_flap_prev_gameid", "") or "")
+                game_flap_prev_game_start_ts = prev_record.get("game_flap_prev_game_start_ts")
+                game_flap_prev_game_accum_seconds = self._safe_int(
+                    prev_record.get("game_flap_prev_game_accum_seconds", 0), 0
+                )
+                game_flap_confirmed = bool(prev_record.get("game_flap_confirmed", False))
+
                 daily_game_seconds = self._safe_int(
                     prev_record.get("daily_game_seconds", 0), 0
                 )
@@ -2464,19 +2608,32 @@ class SteamFriendMonitor(Star):
                 is_offline_candidate = (
                     flap_suppress_sec > 0 and prev is not None and prev != 0 and st == 0
                 )
+                is_game_flap_candidate = bool(game_flap_since and game_flap_prev_game)
+                should_hold_for_game_flap = bool(
+                    flap_suppress_sec > 0
+                    and st != 0
+                    and prev_game
+                    and not game
+                    and not game_flap_confirmed
+                )
 
                 # 关闭游戏/切换游戏：结算当前段到当日总时长；离开等非计时状态则仅暂停不清零。
                 if prev_game:
                     game_changed_or_closed = (not game) or (prev_game != game)
                     if not is_offline_candidate and game_changed_or_closed:
-                        if prev_countable and prev_game_start_ts:
-                            game_accum_seconds += self._session_seconds_in_current_cycle(
-                                prev_game_start_ts,
-                                now_dt,
-                                cycle_start,
-                            )
-                        daily_game_seconds += game_accum_seconds
-                        game_accum_seconds = 0
+                        if not should_hold_for_game_flap and not (
+                            is_game_flap_candidate
+                            and prev_game == game_flap_prev_game
+                            and not game_flap_confirmed
+                        ):
+                            if prev_countable and prev_game_start_ts:
+                                game_accum_seconds += self._session_seconds_in_current_cycle(
+                                    prev_game_start_ts,
+                                    now_dt,
+                                    cycle_start,
+                                )
+                            daily_game_seconds += game_accum_seconds
+                            game_accum_seconds = 0
                     elif (
                         not is_offline_candidate
                         and prev_game == game
@@ -2519,6 +2676,7 @@ class SteamFriendMonitor(Star):
 
                 suppress_online_event = False
                 suppress_offline_event = False
+                suppress_game_stop_event = False
 
                 # 抖动抑制：在线->离线先进入候选状态；候选期内保持在线状态。
                 # 仅当离线持续超过窗口时，才真正切换为离线。
@@ -2591,6 +2749,7 @@ class SteamFriendMonitor(Star):
                                 and game == pending_prev_game
                                 and current_countable
                             ):
+                                suppress_game_start_render = True
                                 if pending_prev_game_start_ts:
                                     game_start_ts = pending_prev_game_start_ts
                                     game_accum_seconds = pending_prev_game_accum_seconds
@@ -2616,6 +2775,51 @@ class SteamFriendMonitor(Star):
                         pending_prev_game_accum_seconds = 0
                         pending_confirmed = False
 
+                # 仅在仍在线时抑制同款游戏短暂中断；离线场景由 presence flap 控制，
+                # 避免两套抑制叠加导致 game_stop 延迟过久。
+                if flap_suppress_sec > 0 and st != 0 and prev_game and not game:
+                    if not game_flap_since:
+                        game_flap_since = now
+                        game_flap_prev_game = prev_game
+                        game_flap_prev_gameid = prev_gameid
+                        game_flap_prev_game_start_ts = prev_game_start_ts
+                        game_flap_prev_game_accum_seconds = prev_game_accum_seconds
+                        game_flap_confirmed = False
+
+                    pending_game_dt = parse_iso(game_flap_since)
+                    if pending_game_dt and (now_dt - pending_game_dt).total_seconds() < flap_suppress_sec:
+                        # 同一款游戏短暂关闭后快速重启：保持上一局展示，不发关闭/启动通知。
+                        suppress_game_stop_event = True
+                        suppress_game_start_render = True
+                        game = game_flap_prev_game or prev_game
+                        current_gameid = game_flap_prev_gameid or prev_gameid
+                        if game_flap_prev_game_start_ts:
+                            game_start_ts = game_flap_prev_game_start_ts
+                        game_accum_seconds = game_flap_prev_game_accum_seconds
+                    elif pending_game_dt:
+                        # 超出窗口仍未恢复同款游戏，确认关闭并在此一次性结算上一局。
+                        daily_game_seconds += game_flap_prev_game_accum_seconds
+                        daily_game_seconds += self._session_seconds_in_current_cycle(
+                            game_flap_prev_game_start_ts,
+                            pending_game_dt,
+                            cycle_start,
+                        )
+                        game_accum_seconds = 0
+                        game_flap_confirmed = True
+
+                if (
+                    game_flap_since
+                    and raw_game
+                    and raw_game == game_flap_prev_game
+                    and current_countable
+                ):
+                    game_flap_since = ""
+                    game_flap_prev_game = ""
+                    game_flap_prev_gameid = ""
+                    game_flap_prev_game_start_ts = None
+                    game_flap_prev_game_accum_seconds = 0
+                    game_flap_confirmed = False
+
                 next_record = {
                     "personaname": p.get("personaname", ""),
                     "personastate": st,
@@ -2634,10 +2838,18 @@ class SteamFriendMonitor(Star):
                     "presence_flap_prev_game_start_ts": pending_prev_game_start_ts,
                     "presence_flap_prev_game_accum_seconds": pending_prev_game_accum_seconds,
                     "presence_flap_confirmed": pending_confirmed,
+                    "game_flap_since": game_flap_since,
+                    "game_flap_prev_game": game_flap_prev_game,
+                    "game_flap_prev_gameid": game_flap_prev_gameid,
+                    "game_flap_prev_game_start_ts": game_flap_prev_game_start_ts,
+                    "game_flap_prev_game_accum_seconds": game_flap_prev_game_accum_seconds,
+                    "game_flap_confirmed": game_flap_confirmed,
                     "ts": now,
                     "missing": False,
                 }
                 target_state[sid] = next_record
+                if prev_record != next_record:
+                    self._mark_state_dirty()
 
                 if prev is None:
                     continue
@@ -2647,6 +2859,28 @@ class SteamFriendMonitor(Star):
                     events.append({"type": "online", "text": f"{name} 上线"})
                 elif prev != 0 and st == 0 and not suppress_offline_event:
                     events.append({"type": "offline", "text": f"{name} 下线"})
+
+                if prev_game and not game and not suppress_game_stop_event:
+                    game_duration = self._format_game_duration(
+                        prev_game_accum_seconds
+                        + self._session_seconds_total(prev_game_start_ts, now_dt)
+                    )
+                    # 判断玩家名和游戏名是否超过20个字符
+                    if len(name) + len(prev_game) > 20:
+                        game_stop_text = f"{name}  结束\n《{prev_game}》 {game_duration}"
+                    else:
+                        game_stop_text = f"{name}  结束《{prev_game}》 {game_duration}"
+                    events.append({"type": "game_stop", "text": game_stop_text})
+
+                    record = target_state.get(sid)
+                    if isinstance(record, dict):
+                        record["game_flap_since"] = ""
+                        record["game_flap_prev_game"] = ""
+                        record["game_flap_prev_gameid"] = ""
+                        record["game_flap_prev_game_start_ts"] = None
+                        record["game_flap_prev_game_accum_seconds"] = 0
+                        record["game_flap_confirmed"] = False
+                        self._mark_state_dirty()
 
                 if st != 0:
                     avatar_url = (
@@ -2668,7 +2902,7 @@ class SteamFriendMonitor(Star):
                         )
                         if is_non_steam_game_start:
                             has_non_steam_game_start = True
-                        if current_gameid:
+                        if current_gameid and not suppress_game_start_render:
                             self._spawn_bg_task(
                                 self._push_game_start_render(
                                     target,
@@ -2679,17 +2913,6 @@ class SteamFriendMonitor(Star):
                                     game,
                                 )
                             )
-                    elif prev_game and not game:
-                        game_duration = self._format_game_duration(
-                            prev_game_accum_seconds
-                            + self._session_seconds_total(prev_game_start_ts, now_dt)
-                        )
-                        # 判断玩家名和游戏名是否超过20个字符
-                        if len(name) + len(prev_game) > 20:
-                            game_stop_text = f"{name}  结束\n《{prev_game}》 {game_duration}"
-                        else:
-                            game_stop_text = f"{name}  结束《{prev_game}》 {game_duration}"
-                        events.append({"type": "game_stop", "text": game_stop_text})
                     elif prev_game and game and prev_game != game:
                         game_duration = self._format_game_duration(
                             prev_game_accum_seconds
@@ -2705,7 +2928,16 @@ class SteamFriendMonitor(Star):
                                 f"{name} 切换游戏\n《{prev_game}》 -> 《{game}》 {game_duration}"
                             )
                         events.append({"type": "game_switch", "text": game_switch_text})
-                        if current_gameid:
+                        record = target_state.get(sid)
+                        if isinstance(record, dict):
+                            record["game_flap_since"] = ""
+                            record["game_flap_prev_game"] = ""
+                            record["game_flap_prev_gameid"] = ""
+                            record["game_flap_prev_game_start_ts"] = None
+                            record["game_flap_prev_game_accum_seconds"] = 0
+                            record["game_flap_confirmed"] = False
+                            self._mark_state_dirty()
+                        if current_gameid and not suppress_game_start_render:
                             self._spawn_bg_task(
                                 self._push_game_start_render(
                                     target,
@@ -2738,8 +2970,6 @@ class SteamFriendMonitor(Star):
                             )
                         )
 
-            self._save_state()
-
             if emit_push and events:
                 text_trigger_types = self._status_text_trigger_types()
                 image_trigger_types = self._status_image_trigger_types()
@@ -2771,25 +3001,6 @@ class SteamFriendMonitor(Star):
                     )
                     return
 
-                if send_image:
-                    min_interval = self._status_image_min_interval_min()
-                else:
-                    min_interval = 0
-
-                if send_image and min_interval > 0:
-                    now_ts = time.time()
-                    last_push_ts = self._get_target_last_push_ts(target)
-                    if last_push_ts > 0 and (now_ts - last_push_ts) < min_interval * 60:
-                        target_key = self._normalize_target_key(target)
-                        logger.info(
-                            "[steam-monitor] status image push skipped by interval limit: "
-                            f"target={target} target_key={target_key} min_interval={min_interval}"
-                        )
-                        send_image = False
-
-                if not send_text and not send_image:
-                    return
-
                 text = chr(10).join(str(e.get("text", "")) for e in text_events)
                 try:
                     if send_image:
@@ -2798,12 +3009,8 @@ class SteamFriendMonitor(Star):
                             ordered_players, target
                         )
                         image_path = await self._render_status_image(ordered_players, target)
-                        if send_text:
-                            await self._push_image(target, text, image_path)
-                        else:
-                            await self._push_image(target, "", image_path)
-                        self._set_target_last_push_ts(target, time.time())
-                        self._save_state()
+                        self._enqueue_image_push(target, text if send_text else "", image_path)
+                        image_path = None
                     else:
                         await self._push_text(target, text)
                 except Exception as e:

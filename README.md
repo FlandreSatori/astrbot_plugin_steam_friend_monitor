@@ -24,32 +24,63 @@
 
 ## 配置项
 
+状态图片和开始游戏卡片共用同一套图片节流与抖动抑制规则，同一群聊内的图片会按顺序排队发送。下面按功能分组，便于快速查找。
+
+### 基础与监控目标
+
 | 配置键 | 默认值 | 说明 |
 | --- | --- | --- |
 | `steam_api_key` | 无 | Steam Web API Key（在 <https://steamcommunity.com/dev/apikey> 申请） |
 | `steam_ids` | `""` | 全局监控 SteamID64，不推荐手动填写 |
 | `push_targets` | `""` | 哪些群启用了监控，不推荐手动填写 |
+
+### 轮询与时长
+
+| 配置键 | 默认值 | 说明 |
+| --- | --- | --- |
 | `poll_interval_sec` | 50 | 基础轮询间隔（秒） |
-| `status_image_min_interval_min` | `3` | 状态图片推送最小间隔（分钟），`0` 表示不限制 |
-| `presence_flap_suppress_min` | `2` | 上下线抖动抑制窗口（分钟），`X`分钟内反复上下线会被视为始终在线 |
+| `cache_ttl_sec` | 300 | 网页抓取缓存有效期（秒） |
 | `count_game_duration_online_only` | `false` | 如果是，则“离开”状态不统计游戏时长 |
+
+### 状态推送与抖动抑制
+
+| 配置键 | 默认值 | 说明 |
+| --- | --- | --- |
 | `status_text_trigger_types` | `online,game_stop,game_switch` | 哪些事件会触发文字推送；可选：`online` `offline` `game_start` `game_stop` `game_switch` |
 | `status_image_trigger_types` |  | 哪些事件会触发状态图推送；可选：`online` `offline` `game_start` `game_stop` `game_switch` |
+| `status_image_min_interval_sec` | `3` | 状态图片和开始游戏卡片共用的最小推送间隔（秒），`0` 表示不限制；用于规避高频发送，一般可弃用。 |
+| `presence_flap_suppress_min` | `2` | 上下线抖动抑制窗口（分钟），`X`分钟内反复上下线会被视为始终在线，也会抑制同一款游戏的短暂关闭/重启 |
+| `enable_non_steam_game_start_text_exception` | `false` | 为非 Steam 游戏启动添加文字推送例外 |
+
+### 成就监控
+
+| 配置键 | 默认值 | 说明 |
+| --- | --- | --- |
 | `enable_achievement_monitor` | `true` | 是否开启成就监控 |
 | `achievement_poll_interval_sec` | `1200` | 成就轮询间隔（秒） |
 | `achievement_final_check_delay_sec` | `300` | 游戏结束后多久再检查一次成就（秒） |
 | `achievement_fail_limit_per_day` | `10` | 同一游戏单日最多查询几次成就 |
 | `max_achievement_notifications` | `5` | 单次最多推送几个新成就 |
-| `enable_game_start_render` | `true` | 是否启用开始游戏的图片消息 |
+
+### 开始游戏卡片
+
+| 配置键 | 默认值 | 说明 |
+| --- | --- | --- |
+| `enable_game_start_render` | `true` | 是否启用开始游戏的图片消息；启用后同样受上述图片推送间隔与抖动抑制约束 |
+| `game_start_bg_image` | `star_767x809.png` | 开始游戏页面背景图文件名或路径 |
+| `game_start_bg_opacity` | `0.15` | 开始游戏页面背景图不透明度（`0.0`-`1.0`） |
+
+### 网络与图片来源
+
+| 配置键 | 默认值 | 说明 |
+| --- | --- | --- |
 | `steam_api_base` | `https://api.steampowered.com` | Steam API 基础地址 |
 | `steam_store_base` | `https://store.steampowered.com` | Steam Store API 基础地址 |
 | `sgdb_api_key` | `""` | SteamGridDB API Key（查询竖版封面） |
 | `sgdb_api_base` | `https://www.steamgriddb.com` | SteamGridDB API 基础地址 |
 | `enable_profile_game_fallback` | `true` | API 未返回游戏名时，尝试从个人资料页读取 |
 | `image_proxy_prefix` | `https://images.weserv.nl/?url=` | 图片中转前缀，留空为直连 |
-| `allow_dns_private_for_allow_domains` | `true` | 是否允许对白名单域名跳过内网解析拦截，保持为True即可 |
-| `game_start_bg_image` | `star_767x809.png` | 开始游戏页面背景图文件名或路径 |
-| `game_start_bg_opacity` | `0.15` | 开始游戏页面背景图不透明度（`0.0`-`1.0`） |
+| `allow_dns_private_for_allow_domains` | `false` | 是否允许对白名单域名跳过内网解析拦截；开启后可缓解部分 DNS 污染场景 |
 
 ## 命令列表
 

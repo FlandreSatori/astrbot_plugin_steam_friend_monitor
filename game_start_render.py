@@ -560,9 +560,13 @@ async def render_game_start(
     steam_api_base=None,
     bg_image_path=None,
     bg_opacity=0.15,
+    client: httpx.AsyncClient | None = None,
 ):
     logger.debug(f"[steam-monitor] render_game_start superpower={superpower}")
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=10, follow_redirects=True)
+    try:
         avatar_path = await get_avatar_path(data_dir, steamid, avatar_url, client=client)
         cover_path = await get_cover_path(
             data_dir,
@@ -584,6 +588,9 @@ async def render_game_start(
                 steam_api_base=steam_api_base,
                 client=client,
             )
+    finally:
+        if owns_client:
+            await client.aclose()
     img = render_game_start_image(
         player_name,
         avatar_path,
