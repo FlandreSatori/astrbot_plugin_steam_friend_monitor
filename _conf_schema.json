@@ -14,7 +14,13 @@
   "poll_interval_sec": {
     "description": "基础轮询间隔（秒）",
     "type": "int",
-    "default": 30
+    "default": 45
+  },
+  "steam_fetch_max_retries": {
+    "description": "Steam 玩家接口失败重试次数",
+    "type": "int",
+    "default": 2,
+    "hint": "不含首次请求；建议 1-4"
   },
   "cache_ttl_sec": {
     "description": "网页抓取缓存有效期（秒）",

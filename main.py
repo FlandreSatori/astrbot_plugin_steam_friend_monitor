@@ -235,9 +235,9 @@ class SteamFriendMonitor(Star):
     def _build_http_client(self) -> httpx.AsyncClient:
         timeout = httpx.Timeout(connect=10.0, read=15.0, write=15.0, pool=5.0)
         limits = httpx.Limits(
-            max_connections=50,
-            max_keepalive_connections=20,
-            keepalive_expiry=30.0,
+            max_connections=30,
+            max_keepalive_connections=10,
+            keepalive_expiry=20.0,
         )
         return httpx.AsyncClient(
             timeout=timeout,
@@ -1219,8 +1219,11 @@ class SteamFriendMonitor(Star):
         batch_size = min(
             100, max(1, int(self.config.get("steam_batch_size", 100) or 100))
         )
-        
-        max_retries = 3
+
+        max_retries = min(
+            10,
+            max(0, int(self.config.get("steam_fetch_max_retries", 3) or 3)),
+        )
         retry_delay = 1.0
         
         players: List[Dict[str, Any]] = []
@@ -1245,7 +1248,8 @@ class SteamFriendMonitor(Star):
                             f"{type(e).__name__} {repr(e)}"
                         )
                         await self._reset_http_client("fetch_players_pool_timeout", e)
-                        await asyncio.sleep(retry_delay * (2 ** attempt))
+                        delay = retry_delay * (2 ** attempt) + random.uniform(0.0, 0.35)
+                        await asyncio.sleep(delay)
                         continue
                     logger.error(
                         "[steam-monitor] fetch players failed after "
@@ -1261,7 +1265,9 @@ class SteamFriendMonitor(Star):
                             f"(attempt {attempt + 1}/{max_retries + 1}): "
                             f"{type(e).__name__} {repr(e)}"
                         )
-                        await asyncio.sleep(retry_delay * (2 ** attempt))  # 指数退避
+                        await self._reset_http_client("fetch_players_network_error", e)
+                        delay = retry_delay * (2 ** attempt) + random.uniform(0.0, 0.35)
+                        await asyncio.sleep(delay)  # 指数退避 + 轻微抖动
                         continue
                     else:
                         logger.error(
