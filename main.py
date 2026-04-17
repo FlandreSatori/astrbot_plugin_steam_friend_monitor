@@ -32,6 +32,8 @@ import astrbot.api.message_components as Comp
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
+EVENT_TEXT_WRAP_THRESHOLD = 20
+
 def parse_ids(raw: str) -> List[str]:
     text = (raw or "").replace(chr(10), ",")
     return [x.strip() for x in text.split(",") if x.strip()]
@@ -156,7 +158,7 @@ class SteamFriendMonitor(Star):
         self._http_last_reset_ts = 0.0
         self.bytes_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self.icon_url_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
-        self._game_name_cache: Dict[str, tuple[str, str]] = {}
+        self._game_name_cache: Dict[str, str] = {}
         self._game_online_count_cache: OrderedDict[str, tuple[float, int]] = OrderedDict()
         self._config_lock = asyncio.Lock()
         self._image_push_lock = asyncio.Lock()
@@ -195,15 +197,15 @@ class SteamFriendMonitor(Star):
     def _ensure_fonts(self):
         """检测插件fonts目录是否有NotoSansHans系列字体，并缓存路径"""
         import shutil
-        plugin_fonts_dir = self.plugin_dir / 'fonts'
-        cache_fonts_dir = self.data_dir / 'fonts'
+        plugin_fonts_dir = self.plugin_dir / "fonts"
+        cache_fonts_dir = self.data_dir / "fonts"
         plugin_fonts_dir.mkdir(parents=True, exist_ok=True)
         cache_fonts_dir.mkdir(parents=True, exist_ok=True)
 
         font_candidates = [
-            'NotoSansHans-Regular.otf',
-            'NotoSansHans-Medium.otf',
-            'NotoSansCJKsc-Regular.otf',  # 兼容旧版本
+            "NotoSansHans-Regular.otf",
+            "NotoSansHans-Medium.otf",
+            "NotoSansCJKsc-Regular.otf",  # 兼容旧版本
         ]
         self.font_paths = {}
         for font_name in font_candidates:
@@ -227,9 +229,9 @@ class SteamFriendMonitor(Star):
     def get_font_path(self, font_name: str | None = None, bold: bool = False) -> str:
         """获取字体路径，优先返回缓存目录下的NotoSansHans字体"""
         if not font_name:
-            font_name = 'NotoSansHans-Regular.otf'
+            font_name = "NotoSansHans-Regular.otf"
         if bold:
-            font_name = 'NotoSansHans-Medium.otf'
+            font_name = "NotoSansHans-Medium.otf"
         return self.font_paths.get(font_name) or font_name
 
     def _build_http_client(self) -> httpx.AsyncClient:
@@ -789,7 +791,7 @@ class SteamFriendMonitor(Star):
         try:
             while not self._stop:
                 await asyncio.sleep(interval_sec)
-                if gameid in self.achievement_monitor.achievement_blacklist:
+                if self.achievement_monitor.is_blacklisted(gameid):
                     break
 
                 before = set(self.achievement_snapshots.get(key, []))
@@ -805,8 +807,10 @@ class SteamFriendMonitor(Star):
                     cnt = self.achievement_fail_count.get(fail_key, 0) + 1
                     self.achievement_fail_count[fail_key] = cnt
                     if cnt >= self._achievement_fail_limit():
-                        self.achievement_monitor.achievement_blacklist.add(gameid)
-                        self.achievement_monitor._save_blacklist()
+                        self.achievement_monitor.mark_blacklisted(
+                            gameid,
+                            reason=f"periodic_fail_limit_reached:{cnt}",
+                        )
                         logger.info(
                             f"[steam-monitor] achievement app blacklisted appid={gameid} fail_count={cnt}"
                         )
@@ -847,7 +851,7 @@ class SteamFriendMonitor(Star):
         cache_key = self.achievement_monitor._make_key(target, sid, gameid)
         try:
             await asyncio.sleep(self._achievement_final_delay_sec())
-            if gameid in self.achievement_monitor.achievement_blacklist:
+            if self.achievement_monitor.is_blacklisted(gameid):
                 return
 
             api_key = str(self.config.get("steam_api_key", "")).strip()
@@ -999,21 +1003,19 @@ class SteamFriendMonitor(Star):
         # 基于 profile 回退文本判定非 Steam 启动，不依赖 gameid。
         return game_name in {"非 Steam 游戏中", "非 Steam 游戏"}
 
-    async def _get_game_names(
+    async def _get_game_name(
         self, gameid: str, fallback_name: str | None = None
-    ) -> tuple[str, str]:
+    ) -> str:
         if not gameid:
             fallback = fallback_name or "未知游戏"
-            return (fallback, fallback)
+            return fallback
 
         gid = str(gameid)
         if gid in self._game_name_cache:
             return self._game_name_cache[gid]
 
         url_zh = f"{self.STEAM_STORE_BASE}/api/appdetails?appids={gid}&l=schinese"
-        url_en = f"{self.STEAM_STORE_BASE}/api/appdetails?appids={gid}&l=en"
         name_zh = fallback_name or "未知游戏"
-        name_en = fallback_name or "未知游戏"
 
         try:
             http = await self._ensure_http_client()
@@ -1021,16 +1023,11 @@ class SteamFriendMonitor(Star):
             data_zh = resp_zh.json()
             info_zh = data_zh.get(gid, {}).get("data", {})
             name_zh = info_zh.get("name") or name_zh
-
-            resp_en = await http.get(url_en)
-            data_en = resp_en.json()
-            info_en = data_en.get(gid, {}).get("data", {})
-            name_en = info_en.get("name") or name_en
         except Exception as e:
-            logger.debug(f"[steam-monitor] get game names failed gameid={gid}: {e}")
+            logger.debug(f"[steam-monitor] get game name failed gameid={gid}: {e}")
 
-        self._game_name_cache[gid] = (name_zh, name_en)
-        return (name_zh, name_en)
+        self._game_name_cache[gid] = name_zh
+        return name_zh
 
     async def _get_game_online_count(self, gameid: str) -> int | None:
         gid = str(gameid or "").strip()
@@ -1068,7 +1065,7 @@ class SteamFriendMonitor(Star):
             return
 
         try:
-            zh_game_name, en_game_name = await self._get_game_names(gameid, game_name)
+            zh_game_name = await self._get_game_name(gameid, game_name)
             online_count = await self._get_game_online_count(gameid)
             font_path = self.get_font_path("NotoSansHans-Regular.otf") or str(
                 self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf"
@@ -1098,7 +1095,6 @@ class SteamFriendMonitor(Star):
                 superpower=None,
                 sgdb_api_key=self.SGDB_API_KEY,
                 font_path=font_path,
-                sgdb_game_name=en_game_name,
                 online_count=online_count,
                 appid=gameid,
                 sgdb_api_base=self.SGDB_API_BASE,
@@ -1764,9 +1760,10 @@ class SteamFriendMonitor(Star):
         if not game_name:
             return ""
 
-        # 精确匹配规则
+        # 过滤
         exact_mappings = {
             "当前正在游戏": "",
+            "当前离线": "",
             "当前在线": "",
             "VR 在线": "VR",
             "非 Steam 游戏中": "非 Steam 游戏",
@@ -1827,8 +1824,8 @@ class SteamFriendMonitor(Star):
             )
             if not raw:
                 logger.debug(
-                        f"[steam-monitor] profile get failed url={profile_url}"
-                    )
+                    f"[steam-monitor] profile get failed url={profile_url}"
+                )
                 continue
 
             try:
@@ -1870,7 +1867,7 @@ class SteamFriendMonitor(Star):
             if fallback_game:
                 p["gameextrainfo"] = fallback_game
                 logger.debug(
-                    f"[steam-monitor] profile fallback game={fallback_game} steamid={sid}\n "
+                    f"[steam-monitor] profile fallback game={fallback_game} steamid={sid}"
                 )
 
         return players
@@ -2060,10 +2057,8 @@ class SteamFriendMonitor(Star):
         else:
             return ""
 
-    def _get_game_duration_for_player(
-        self, sid: str, now: datetime, target: str = ""
-    ) -> str:
-        """获取当前玩家的游戏时长，返回格式化字符串；如果没有在玩游戏则返回空"""
+    def _get_player_record_for_display(self, sid: str, target: str = "") -> Dict[str, Any]:
+        """按 target 优先、全局兜底获取玩家记录。"""
         record: Dict[str, Any] = {}
         if target:
             target_state = self._get_target_player_state(target)
@@ -2074,6 +2069,13 @@ class SteamFriendMonitor(Star):
             data = self.state.get(sid, {})
             if isinstance(data, dict):
                 record = data
+        return record if isinstance(record, dict) else {}
+
+    def _get_game_duration_for_player(
+        self, sid: str, now: datetime, target: str = ""
+    ) -> str:
+        """获取当前玩家的游戏时长，返回格式化字符串；如果没有在玩游戏则返回空"""
+        record = self._get_player_record_for_display(sid, target)
         if not isinstance(record, dict):
             return ""
 
@@ -2099,16 +2101,7 @@ class SteamFriendMonitor(Star):
     def _get_daily_game_duration_for_player(
         self, sid: str, now: datetime, target: str = ""
     ) -> str:
-        record: Dict[str, Any] = {}
-        if target:
-            target_state = self._get_target_player_state(target)
-            data = target_state.get(sid, {})
-            if isinstance(data, dict):
-                record = data
-        if not record:
-            data = self.state.get(sid, {})
-            if isinstance(data, dict):
-                record = data
+        record = self._get_player_record_for_display(sid, target)
 
         if not isinstance(record, dict):
             return ""
@@ -2134,16 +2127,7 @@ class SteamFriendMonitor(Star):
     def _get_display_game_duration_for_player(
         self, sid: str, now: datetime, target: str = ""
     ) -> str:
-        record: Dict[str, Any] = {}
-        if target:
-            target_state = self._get_target_player_state(target)
-            data = target_state.get(sid, {})
-            if isinstance(data, dict):
-                record = data
-        if not record:
-            data = self.state.get(sid, {})
-            if isinstance(data, dict):
-                record = data
+        record = self._get_player_record_for_display(sid, target)
         if not isinstance(record, dict):
             return ""
 
@@ -2882,8 +2866,8 @@ class SteamFriendMonitor(Star):
                         prev_game_accum_seconds
                         + self._session_seconds_total(prev_game_start_ts, prev_game_duration_end_dt)
                     )
-                    # 判断玩家名和游戏名是否超过20个字符
-                    if len(name) + len(prev_game) > 20:
+                    # 判断玩家名和游戏名是否超过阈值字符
+                    if len(name) + len(prev_game) > EVENT_TEXT_WRAP_THRESHOLD:
                         game_stop_text = f"{name}  结束\n《{prev_game}》 {game_duration}"
                     else:
                         game_stop_text = f"{name}  结束《{prev_game}》 {game_duration}"
@@ -2891,12 +2875,7 @@ class SteamFriendMonitor(Star):
 
                     record = target_state.get(sid)
                     if isinstance(record, dict):
-                        record["game_flap_since"] = ""
-                        record["game_flap_prev_game"] = ""
-                        record["game_flap_prev_gameid"] = ""
-                        record["game_flap_prev_game_start_ts"] = None
-                        record["game_flap_prev_game_accum_seconds"] = 0
-                        record["game_flap_confirmed"] = False
+                        self._reset_game_flap_state(record)
                         self._mark_state_dirty()
 
                 if st != 0:
@@ -2904,8 +2883,8 @@ class SteamFriendMonitor(Star):
                         str(p.get("avatarfull") or p.get("avatarmedium") or p.get("avatar") or "")
                     )
                     if not prev_game and game:
-                        # 判断玩家名和游戏名是否超过20个字符
-                        if len(name) + len(game) > 20:
+                        # 判断玩家名和游戏名是否超过阈值字符
+                        if len(name) + len(game) > EVENT_TEXT_WRAP_THRESHOLD:
                             game_start_text = f"{name} 启动\n《{game}》"
                         else:
                             game_start_text = f"{name} 启动《{game}》"
@@ -2935,8 +2914,8 @@ class SteamFriendMonitor(Star):
                             prev_game_accum_seconds
                             + self._session_seconds_total(prev_game_start_ts, prev_game_duration_end_dt)
                         )
-                        # 判断旧游戏名和游戏名是否超过20个字符（对于切换游戏，检查新游戏名）
-                        if len(prev_game) + len(game) > 20:
+                        # 判断旧游戏名和游戏名是否超过阈值字符（对于切换游戏，检查新游戏名）
+                        if len(prev_game) + len(game) > EVENT_TEXT_WRAP_THRESHOLD:
                             game_switch_text = (
                                 f"{name} 切换游戏\n《{prev_game}》 -> \n《{game}》 {game_duration}"
                             )
@@ -2947,12 +2926,7 @@ class SteamFriendMonitor(Star):
                         events.append({"type": "game_switch", "text": game_switch_text})
                         record = target_state.get(sid)
                         if isinstance(record, dict):
-                            record["game_flap_since"] = ""
-                            record["game_flap_prev_game"] = ""
-                            record["game_flap_prev_gameid"] = ""
-                            record["game_flap_prev_game_start_ts"] = None
-                            record["game_flap_prev_game_accum_seconds"] = 0
-                            record["game_flap_confirmed"] = False
+                            self._reset_game_flap_state(record)
                             self._mark_state_dirty()
                         if current_gameid and not suppress_game_start_render:
                             self._spawn_bg_task(
@@ -2988,54 +2962,82 @@ class SteamFriendMonitor(Star):
                         )
 
             if emit_push and events:
-                text_trigger_types = self._status_text_trigger_types()
-                image_trigger_types = self._status_image_trigger_types()
-                text_events = [e for e in events if e.get("type") in text_trigger_types]
-                image_events = [e for e in events if e.get("type") in image_trigger_types]
-                send_text = bool(text_events)
-                send_image = bool(image_events)
-
-                # 例外：即使关闭了 game_start 文字触发，也允许非 Steam 游戏启动时推送文字。
-                if (
-                    not send_text
-                    and "game_start" not in text_trigger_types
-                    and has_non_steam_game_start
-                    and self._non_steam_game_start_text_exception_enabled()
-                ):
-                    text_events = [
-                        e
-                        for e in events
-                        if e.get("type") == "game_start" and bool(e.get("is_non_steam"))
-                    ]
-                    send_text = True
-
-                if not send_text and not send_image:
-                    logger.debug(
-                        "[steam-monitor] event push skipped by trigger types: "
-                        f"event_types={sorted({str(e.get('type', '')) for e in events})} "
-                        f"text_trigger_types={sorted(text_trigger_types)} "
-                        f"image_trigger_types={sorted(image_trigger_types)}"
-                    )
-                    return
-
-                text = chr(10).join(str(e.get("text", "")) for e in text_events)
-                try:
-                    if send_image:
-                        ordered_players = self._order_players_by_ids(players, steam_ids)
-                        ordered_players = self._apply_presence_flap_view_state(
-                            ordered_players, target
-                        )
-                        image_path = await self._render_status_image(ordered_players, target)
-                        self._enqueue_image_push(target, text if send_text else "", image_path)
-                        image_path = None
-                    else:
-                        await self._push_text(target, text)
-                except Exception as e:
-                    logger.error(f"[steam-monitor] push failed {target}: {e}")
+                image_path = await self._emit_target_events(
+                    target=target,
+                    events=events,
+                    players=players,
+                    steam_ids=steam_ids,
+                    has_non_steam_game_start=has_non_steam_game_start,
+                    image_path=image_path,
+                )
         finally:
             if image_path:
                 with contextlib.suppress(Exception):
                     Path(image_path).unlink(missing_ok=True)
+
+    def _reset_game_flap_state(self, record: Dict[str, Any]):
+        record["game_flap_since"] = ""
+        record["game_flap_prev_game"] = ""
+        record["game_flap_prev_gameid"] = ""
+        record["game_flap_prev_game_start_ts"] = None
+        record["game_flap_prev_game_accum_seconds"] = 0
+        record["game_flap_confirmed"] = False
+
+    async def _emit_target_events(
+        self,
+        target: str,
+        events: List[dict[str, Any]],
+        players: List[Dict[str, Any]],
+        steam_ids: List[str],
+        has_non_steam_game_start: bool,
+        image_path: str | None,
+    ) -> str | None:
+        text_trigger_types = self._status_text_trigger_types()
+        image_trigger_types = self._status_image_trigger_types()
+        text_events = [e for e in events if e.get("type") in text_trigger_types]
+        image_events = [e for e in events if e.get("type") in image_trigger_types]
+        send_text = bool(text_events)
+        send_image = bool(image_events)
+
+        # 例外：即使关闭了 game_start 文字触发，也允许非 Steam 游戏启动时推送文字。
+        if (
+            not send_text
+            and "game_start" not in text_trigger_types
+            and has_non_steam_game_start
+            and self._non_steam_game_start_text_exception_enabled()
+        ):
+            text_events = [
+                e
+                for e in events
+                if e.get("type") == "game_start" and bool(e.get("is_non_steam"))
+            ]
+            send_text = True
+
+        if not send_text and not send_image:
+            logger.debug(
+                "[steam-monitor] event push skipped by trigger types: "
+                f"event_types={sorted({str(e.get('type', '')) for e in events})} "
+                f"text_trigger_types={sorted(text_trigger_types)} "
+                f"image_trigger_types={sorted(image_trigger_types)}"
+            )
+            return image_path
+
+        text = chr(10).join(str(e.get("text", "")) for e in text_events)
+        try:
+            if send_image:
+                ordered_players = self._order_players_by_ids(players, steam_ids)
+                ordered_players = self._apply_presence_flap_view_state(
+                    ordered_players, target
+                )
+                image_path = await self._render_status_image(ordered_players, target)
+                self._enqueue_image_push(target, text if send_text else "", image_path)
+                return None
+
+            await self._push_text(target, text)
+            return image_path
+        except Exception as e:
+            logger.error(f"[steam-monitor] push failed {target}: {e}")
+            return image_path
 
     def _validate_steam_id64(self, sid: str) -> bool:
         sid = (sid or "").strip()
@@ -3430,7 +3432,7 @@ class SteamFriendMonitor(Star):
                 player.get("avatarfull") or player.get("avatarmedium") or player.get("avatar") or ""
             )
 
-            zh_game_name, en_game_name = await self._get_game_names(gid, fallback_name=gid)
+            zh_game_name = await self._get_game_name(gid, fallback_name=gid)
             online_count = await self._get_game_online_count(gid)
 
             font_path = self.get_font_path("NotoSansHans-Regular.otf") or str(self.plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf")
@@ -3446,7 +3448,6 @@ class SteamFriendMonitor(Star):
                 superpower=None,
                 sgdb_api_key=self.SGDB_API_KEY,
                 font_path=font_path,
-                sgdb_game_name=en_game_name,
                 online_count=online_count,
                 appid=gid,
                 sgdb_api_base=self.SGDB_API_BASE,

@@ -19,7 +19,7 @@
   "steam_fetch_max_retries": {
     "description": "Steam 玩家接口失败重试次数",
     "type": "int",
-    "default": 2,
+    "default": 3,
     "hint": "不含首次请求；建议 1-4"
   },
   "cache_ttl_sec": {
@@ -73,7 +73,7 @@
   "presence_flap_suppress_min": {
     "description": "上下线抖动抑制窗口（分钟，0 表示不抑制）",
     "type": "int",
-    "default": 2,
+    "default": 3,
     "hint": "窗口内重复上下线、同一款游戏的短暂关闭/重启都会被忽略"
   },
   "enable_non_steam_game_start_text_exception": {

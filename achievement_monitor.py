@@ -34,6 +34,8 @@ class AchievementMonitor:
 
         self.initial_achievements: Dict[str, list[str]] = {}
         self.achievement_blacklist: set[str] = set()
+        self.achievement_blacklist_until: Dict[str, float] = {}
+        self.blacklist_cooldown_sec = 6 * 3600
         self.details_cache: OrderedDict[tuple[str, str], tuple[float, Dict[str, Any]]] = OrderedDict()
         self.details_cache_ttl_sec = 3600
         self.details_cache_max_items = 256
@@ -72,25 +74,91 @@ class AchievementMonitor:
     def _load_blacklist(self):
         if not self.blacklist_file.exists():
             self.achievement_blacklist = set()
+            self.achievement_blacklist_until = {}
             return
         try:
             data = json.loads(self.blacklist_file.read_text(encoding="utf-8"))
             if isinstance(data, list):
-                self.achievement_blacklist = {str(x) for x in data if str(x).strip()}
+                # 兼容旧版本：旧文件是永久黑名单列表，这里迁移为限时冷却。
+                now_ts = time.time()
+                self.achievement_blacklist_until = {
+                    str(x): now_ts + self.blacklist_cooldown_sec
+                    for x in data
+                    if str(x).strip()
+                }
+            elif isinstance(data, dict):
+                now_ts = time.time()
+                normalized: Dict[str, float] = {}
+                for appid, until in data.items():
+                    appid_s = str(appid or "").strip()
+                    if not appid_s:
+                        continue
+                    try:
+                        until_ts = float(until)
+                    except Exception:
+                        continue
+                    if until_ts > now_ts:
+                        normalized[appid_s] = until_ts
+                self.achievement_blacklist_until = normalized
             else:
-                self.achievement_blacklist = set()
+                self.achievement_blacklist_until = {}
         except Exception as e:
             logger.warning(f"[steam-monitor] load achievement blacklist failed: {e}")
-            self.achievement_blacklist = set()
+            self.achievement_blacklist_until = {}
+        self._sync_blacklist_set()
 
     def _save_blacklist(self):
         try:
+            self._cleanup_blacklist()
             self.blacklist_file.write_text(
-                json.dumps(sorted(self.achievement_blacklist), ensure_ascii=False, indent=2),
+                json.dumps(self.achievement_blacklist_until, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except Exception as e:
             logger.warning(f"[steam-monitor] save achievement blacklist failed: {e}")
+
+    def _sync_blacklist_set(self):
+        self.achievement_blacklist = set(self.achievement_blacklist_until.keys())
+
+    def _cleanup_blacklist(self) -> bool:
+        now_ts = time.time()
+        before = len(self.achievement_blacklist_until)
+        self.achievement_blacklist_until = {
+            appid: until
+            for appid, until in self.achievement_blacklist_until.items()
+            if float(until) > now_ts
+        }
+        self._sync_blacklist_set()
+        return len(self.achievement_blacklist_until) != before
+
+    def is_blacklisted(self, appid: str) -> bool:
+        appid = str(appid or "").strip()
+        if not appid:
+            return False
+        changed = self._cleanup_blacklist()
+        if changed:
+            self._save_blacklist()
+        return appid in self.achievement_blacklist_until
+
+    def mark_blacklisted(
+        self,
+        appid: str,
+        reason: str = "",
+        cooldown_sec: int | None = None,
+    ):
+        appid = str(appid or "").strip()
+        if not appid:
+            return
+        duration = int(cooldown_sec if cooldown_sec is not None else self.blacklist_cooldown_sec)
+        duration = max(60, duration)
+        until_ts = time.time() + duration
+        self.achievement_blacklist_until[appid] = until_ts
+        self._sync_blacklist_set()
+        self._save_blacklist()
+        logger.info(
+            "[steam-monitor] app added to cooldown blacklist "
+            f"appid={appid} reason={reason or 'unknown'} cooldown_sec={duration}"
+        )
 
     async def get_player_achievements(
         self,
@@ -104,7 +172,7 @@ class AchievementMonitor:
         steamid = str(steamid or "").strip()
         if not api_key or not steamid or not appid:
             return None
-        if appid in self.achievement_blacklist:
+        if self.is_blacklisted(appid):
             return None
 
         url = f"{self.steam_api_base}/ISteamUserStats/GetPlayerAchievements/v1/"
@@ -156,9 +224,7 @@ class AchievementMonitor:
                     )
 
         if all_failed:
-            self.achievement_blacklist.add(appid)
-            self._save_blacklist()
-            logger.info(f"[steam-monitor] app added to achievement blacklist appid={appid}")
+            self.mark_blacklisted(appid, reason="get_player_achievements_all_failed")
         return None
 
     async def get_achievement_details(
@@ -171,7 +237,7 @@ class AchievementMonitor:
     ) -> Dict[str, Any]:
         """获取成就详情：apiname -> {name, description, icon, icon_gray, percent}。"""
         appid = str(appid or "").strip()
-        if not appid or appid in self.achievement_blacklist:
+        if not appid or self.is_blacklisted(appid):
             return {}
 
         cache_key = (str(target), appid)
