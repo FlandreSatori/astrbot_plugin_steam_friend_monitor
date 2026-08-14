@@ -29,6 +29,7 @@
 | `steam_api_key` | 无 | Steam Web API Key（在 <https://steamcommunity.com/dev/apikey> 申请） |
 | `push_targets` | `""` | 已启用插件的会话列表，建议通过命令维护 |
 | `poll_interval_sec` | `30` | 基础轮询间隔（秒） |
+| `proxy_url` | `""` | 网络代理地址，留空直连；例如 `http://127.0.0.1:7890` |
 | `cache_ttl_sec` | `120` | 网页抓取缓存有效期（秒，不低于 60） |
 | `count_game_duration_online_only` | `true` | 仅在“在线”状态统计游戏时长 |
 | `status_text_trigger_types` | `online,game_stop,game_switch` | 文字推送触发事件，可选：`online,offline,game_start,game_stop,game_switch` |
@@ -50,7 +51,6 @@
 | `sgdb_api_base` | `https://www.steamgriddb.com` | SteamGridDB API 基础地址 |
 | `enable_profile_game_fallback` | `true` | API 未返回游戏名时，尝试从个人资料页读取 |
 | `image_proxy_prefix` | `https://images.weserv.nl/?url=` | 图片中转前缀，留空直连 |
-| `allow_dns_private_for_allow_domains` | `false` | 白名单域名是否跳过内网解析拦截 |
 
 ## 命令列表
 

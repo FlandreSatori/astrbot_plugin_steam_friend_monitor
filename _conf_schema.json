@@ -22,6 +22,12 @@
     "default": 3,
     "hint": "不含首次请求；建议 1-4"
   },
+  "proxy_url": {
+    "description": "使用代理地址（留空直连）",
+    "type": "string",
+    "default": "",
+    "hint": "例如 http://127.0.0.1:7890 或 http://user:password@host:port；代理将用于所有网络请求"
+  },
   "cache_ttl_sec": {
     "description": "网页抓取缓存有效期（秒）",
     "type": "int",
@@ -141,11 +147,5 @@
     "type": "string",
     "default": "https://images.weserv.nl/?url=",
     "hint": "留空为直连；可用 {url} 或 %s 占位，例如 https://images.weserv.nl/?url= 或 https://your-proxy/fetch?url={url}"
-  },
-  "allow_dns_private_for_allow_domains": {
-    "description": "允许对白名单域名跳过内网解析拦截",
-    "type": "bool",
-    "default": false,
-    "hint": "用于修复部分网络环境下 Steam 域名被 DNS污染/代理 为私网地址导致的误拦截；关闭后将恢复严格拦截"
   }
 }

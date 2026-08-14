@@ -241,10 +241,16 @@ class SteamFriendMonitor(Star):
             max_keepalive_connections=10,
             keepalive_expiry=20.0,
         )
+        proxy_url = str(self.config.get("proxy_url", "") or "").strip()
+        client_kwargs: Dict[str, Any] = {
+            "timeout": timeout,
+            "follow_redirects": True,
+            "limits": limits,
+        }
+        if proxy_url:
+            client_kwargs["proxy"] = proxy_url
         return httpx.AsyncClient(
-            timeout=timeout,
-            follow_redirects=True,
-            limits=limits,
+            **client_kwargs,
         )
 
     async def _ensure_http_client(self) -> httpx.AsyncClient:
@@ -293,10 +299,11 @@ class SteamFriendMonitor(Star):
             f"python={platform.python_version()}"
         )
         logger.info(
-            "[steam-monitor] image cfg: "
+            "[steam-monitor] network cfg: "
+            f"proxy_url={'configured' if self.config.get('proxy_url', '') else 'direct'} "
+            "image cfg: "
             f"image_proxy_prefix={self.config.get('image_proxy_prefix', 'https://images.weserv.nl/?url=')} "
             f"strict_remote_host={self.config.get('strict_remote_host', False)} "
-            f"allow_dns_private_for_allow_domains={self.config.get('allow_dns_private_for_allow_domains', False)} "
             f"remote_host_allowlist={self.config.get('remote_host_allowlist', '')} "
             f"max_redirects={self.config.get('max_redirects', 3)} "
             f"max_image_bytes={self.config.get('max_image_bytes', 3 * 1024 * 1024)}"
@@ -1434,22 +1441,13 @@ class SteamFriendMonitor(Star):
                 )
                 return False
 
-            allow_domains = self._remote_host_allow_domains()
-            bypass_dns_private = bool(
-                self.config.get("allow_dns_private_for_allow_domains", False)
-            )
-            if bypass_dns_private and self._is_host_in_domains(host, allow_domains):
-                logger.debug(
-                    "[steam-monitor] skip dns-private check for allow-domain: "
-                    f"url={url} host={host}"
+            if await self._is_host_resolved_private(host):
+                logger.warning(
+                    f"[steam-monitor] blocked remote url by dns-resolved private ip: url={url} host={host}"
                 )
-            else:
-                if await self._is_host_resolved_private(host):
-                    logger.warning(
-                        f"[steam-monitor] blocked remote url by dns-resolved private ip: url={url} host={host}"
-                    )
-                    return False
+                return False
 
+            allow_domains = self._remote_host_allow_domains()
             strict = bool(self.config.get("strict_remote_host", False))
             if not strict:
                 logger.debug(
