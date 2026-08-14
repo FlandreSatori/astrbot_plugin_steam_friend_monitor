@@ -29,7 +29,7 @@
 | `steam_api_key` | 无 | Steam Web API Key（在 <https://steamcommunity.com/dev/apikey> 申请） |
 | `push_targets` | `""` | 已启用插件的会话列表，建议通过命令维护 |
 | `poll_interval_sec` | `30` | 基础轮询间隔（秒） |
-| `proxy_url` | `""` | 网络代理地址，留空直连；例如 `http://127.0.0.1:7890` |
+| `proxy_url` | `""` | 网络代理地址，留空直连；例如 `http://127.0.0.1:7890`。启用后跳过目标域名的本机 DNS 私网预解析，由代理解析目标域名。 |
 | `cache_ttl_sec` | `120` | 网页抓取缓存有效期（秒，不低于 60） |
 | `count_game_duration_online_only` | `true` | 仅在“在线”状态统计游戏时长 |
 | `status_text_trigger_types` | `online,game_stop,game_switch` | 文字推送触发事件，可选：`online,offline,game_start,game_stop,game_switch` |

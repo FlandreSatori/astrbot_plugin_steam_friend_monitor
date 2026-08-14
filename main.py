@@ -234,6 +234,9 @@ class SteamFriendMonitor(Star):
             font_name = "NotoSansHans-Medium.otf"
         return self.font_paths.get(font_name) or font_name
 
+    def _proxy_url(self) -> str:
+        return str(self.config.get("proxy_url", "") or "").strip()
+
     def _build_http_client(self) -> httpx.AsyncClient:
         timeout = httpx.Timeout(connect=10.0, read=15.0, write=15.0, pool=5.0)
         limits = httpx.Limits(
@@ -241,7 +244,7 @@ class SteamFriendMonitor(Star):
             max_keepalive_connections=10,
             keepalive_expiry=20.0,
         )
-        proxy_url = str(self.config.get("proxy_url", "") or "").strip()
+        proxy_url = self._proxy_url()
         client_kwargs: Dict[str, Any] = {
             "timeout": timeout,
             "follow_redirects": True,
@@ -1441,11 +1444,16 @@ class SteamFriendMonitor(Star):
                 )
                 return False
 
-            if await self._is_host_resolved_private(host):
+            if not self._proxy_url() and await self._is_host_resolved_private(host):
                 logger.warning(
                     f"[steam-monitor] blocked remote url by dns-resolved private ip: url={url} host={host}"
                 )
                 return False
+            if self._proxy_url():
+                logger.debug(
+                    "[steam-monitor] skip local DNS private check because proxy_url is configured: "
+                    f"url={url} host={host}"
+                )
 
             allow_domains = self._remote_host_allow_domains()
             strict = bool(self.config.get("strict_remote_host", False))

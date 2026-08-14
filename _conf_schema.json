@@ -26,7 +26,7 @@
     "description": "使用代理地址（留空直连）",
     "type": "string",
     "default": "",
-    "hint": "例如 http://127.0.0.1:7890 或 http://user:password@host:port；代理将用于所有网络请求"
+    "hint": "例如 http://127.0.0.1:7890 或 http://user:password@host:port；代理将用于所有网络请求，并跳过目标域名的本机 DNS 私网预解析"
   },
   "cache_ttl_sec": {
     "description": "网页抓取缓存有效期（秒）",
