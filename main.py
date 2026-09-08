@@ -3175,12 +3175,14 @@ class SteamFriendMonitor(Star):
             "/sfm_test [game_start|achievement] [gameid]\n"
             "  测试渲染卡片（使用当前会话第一个监控对象）"
         )
+        event.stop_event()
         yield event.plain_result(help_text)
 
     @filter.command("sfm_bind")
     async def bind_group(self, event: AstrMessageEvent):
 
         if not self._is_authorized(event):
+            event.stop_event()
             yield event.plain_result("无权限执行该命令")
             return
         umo = event.unified_msg_origin
@@ -3188,6 +3190,7 @@ class SteamFriendMonitor(Star):
         if umo not in targets:
             targets.append(umo)
             await self._update_targets_atomic(targets)
+        event.stop_event()
         yield event.plain_result(
             "已绑定当前会话"
         )
@@ -3196,20 +3199,24 @@ class SteamFriendMonitor(Star):
     async def unbind_group(self, event: AstrMessageEvent):
 
         if not self._is_authorized(event):
+            event.stop_event()
             yield event.plain_result("无权限执行该命令")
             return
         group_id = event.unified_msg_origin
         await self._clear_group_config(group_id)
+        event.stop_event()
         yield event.plain_result("已取消当前会话绑定，并清除配置")
 
     @filter.command("sfm")
     async def status(self, event: AstrMessageEvent):
         if not self._is_authorized(event):
+            event.stop_event()
             yield event.plain_result("无权限执行该命令")
             return
         group_id = event.unified_msg_origin
         steam_ids = self._get_group_steam_ids(group_id) or []
         if not steam_ids:
+            event.stop_event()
             yield event.plain_result("未配置视奸列表")
             return
 
@@ -3231,6 +3238,7 @@ class SteamFriendMonitor(Star):
                 )
                 ordered_players = self._get_players_from_state_snapshot(group_id, steam_ids)
                 if not ordered_players:
+                    event.stop_event()
                     yield event.plain_result("本地缓存为空，请稍后重试")
                     return
             ordered_players = self._apply_presence_flap_view_state(
@@ -3240,8 +3248,10 @@ class SteamFriendMonitor(Star):
                 ordered_players, event.unified_msg_origin
             )
             await self._push_image(event.unified_msg_origin, "", image_path)
+            event.stop_event()
         except RuntimeError as e:
             logger.error(f"[steam-monitor] status failed: {e}")
+            event.stop_event()
             yield event.plain_result(f"获取状态失败: {str(e)}")
         except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
             logger.error(f"[steam-monitor] status network error: {e}")
@@ -3253,9 +3263,11 @@ class SteamFriendMonitor(Star):
                 "• 本地网络连接中断\n"
                 "• DNS 解析失败"
             )
+            event.stop_event()
             yield event.plain_result(error_msg)
         except Exception as e:
             logger.error(f"[steam-monitor] status failed: {e}", exc_info=True)
+            event.stop_event()
             yield event.plain_result(f"获取状态失败: {e}")
         finally:
             if image_path:
@@ -3269,6 +3281,7 @@ class SteamFriendMonitor(Star):
         gameid: str = "",
     ):
         if not self._is_authorized(event):
+            event.stop_event()
             yield event.plain_result("无权限执行该命令")
             return
 
@@ -3279,6 +3292,7 @@ class SteamFriendMonitor(Star):
         # 默认行为：强制拉取最新状态后渲染，便于排查缓存与轮询问题。
         if not action:
             if not steam_ids:
+                event.stop_event()
                 yield event.plain_result("当前群未配置视奸对象，请先 /sfm_add")
                 return
 
@@ -3293,6 +3307,7 @@ class SteamFriendMonitor(Star):
 
                 ordered_players = self._get_players_from_state_snapshot(group_id, steam_ids)
                 if not ordered_players:
+                    event.stop_event()
                     yield event.plain_result("已尝试拉取最新状态，但暂无可渲染数据")
                     return
 
@@ -3301,8 +3316,10 @@ class SteamFriendMonitor(Star):
                 )
                 image_path = await self._render_status_image(ordered_players, group_id)
                 await self._push_image(group_id, "", image_path)
+                event.stop_event()
             except RuntimeError as e:
                 logger.error(f"[steam-monitor] sfm_test force refresh failed: {e}")
+                event.stop_event()
                 yield event.plain_result(f"强制拉取状态失败: {str(e)}")
             except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
                 logger.error(f"[steam-monitor] sfm_test network error: {e}")
@@ -3314,9 +3331,11 @@ class SteamFriendMonitor(Star):
                     "• 本地网络连接中断\n"
                     "• DNS 解析失败"
                 )
+                event.stop_event()
                 yield event.plain_result(error_msg)
             except Exception as e:
                 logger.error(f"[steam-monitor] sfm_test force refresh failed: {e}", exc_info=True)
+                event.stop_event()
                 yield event.plain_result(f"强制拉取状态失败: {e}")
             finally:
                 if image_path:
@@ -3324,15 +3343,18 @@ class SteamFriendMonitor(Star):
             return
 
         if action not in ("game_start", "achievement"):
+            event.stop_event()
             yield event.plain_result("用法：/sfm_test [game_start|achievement] [gameid]")
             return
 
         if not steam_ids:
+            event.stop_event()
             yield event.plain_result("当前群未配置视奸对象，请先 /sfm_add")
             return
 
         gid = str(gameid or "").strip()
         if not gid.isdigit():
+            event.stop_event()
             yield event.plain_result("请提供 gameid，例如：/sfm_test game_start 550")
             return
 
@@ -3354,12 +3376,14 @@ class SteamFriendMonitor(Star):
         count: int = 3,
     ):
         if not self._is_authorized(event):
+            event.stop_event()
             yield event.plain_result("无权限执行该命令")
             return
 
         gid = str(gameid)
         api_key = str(self.config.get("steam_api_key", "")).strip()
         if not api_key:
+            event.stop_event()
             yield event.plain_result("未配置 steam_api_key")
             return
 
@@ -3370,6 +3394,7 @@ class SteamFriendMonitor(Star):
             gid,
         )
         if not achievements:
+            event.stop_event()
             yield event.plain_result("未获取到任何成就，可能为隐私或无成就")
             return
 
@@ -3381,6 +3406,7 @@ class SteamFriendMonitor(Star):
             steamid=steamid,
         )
         if not details:
+            event.stop_event()
             yield event.plain_result("获取成就详情失败")
             return
 
@@ -3413,9 +3439,11 @@ class SteamFriendMonitor(Star):
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
             self._schedule_delayed_unlink(tmp_path, 30)
+            event.stop_event()
             yield event.image_result(tmp_path)
         except Exception as e:
             logger.error(f"[steam-monitor] test achievement render failed: {e}", exc_info=True)
+            event.stop_event()
             yield event.plain_result(f"成就图片渲染失败: {e}")
 
     # removed command: steam test_game_start_render
@@ -3426,6 +3454,7 @@ class SteamFriendMonitor(Star):
         gameid: int,
     ):
         if not self._is_authorized(event):
+            event.stop_event()
             yield event.plain_result("无权限执行该命令")
             return
 
@@ -3467,26 +3496,31 @@ class SteamFriendMonitor(Star):
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
             self._schedule_delayed_unlink(tmp_path, 30)
+            event.stop_event()
             yield event.image_result(tmp_path)
         except Exception as e:
             logger.error(f"[steam-monitor] test game start render failed: {e}", exc_info=True)
+            event.stop_event()
             yield event.plain_result(f"开始游戏图片渲染失败: {e}")
 
     @filter.command("sfm_add")
     async def add_group_id(self, event: AstrMessageEvent, ids: str):
         """为当前群添加视奸 ID（支持逗号/换行批量，兼容好友码和主页链接）"""
         if not self._is_authorized(event):
+            event.stop_event()
             yield event.plain_result("无权限执行该命令")
             return
 
         group_id = event.unified_msg_origin
         targets = self._get_targets()
         if group_id not in targets:
+            event.stop_event()
             yield event.plain_result("当前会话未启用推送，请先执行 /sfm_bind")
             return
 
         parsed = parse_ids(ids)
         if not parsed:
+            event.stop_event()
             yield event.plain_result("未添加任何有效的 SteamID64")
             return
 
@@ -3500,6 +3534,7 @@ class SteamFriendMonitor(Star):
                 failed.append(f"{raw}({err})")
 
         if not valid:
+            event.stop_event()
             yield event.plain_result(
                 "未添加任何有效的 SteamID64：\n" + "\n".join(failed[:5])
             )
@@ -3518,22 +3553,26 @@ class SteamFriendMonitor(Star):
         msg = f"添加完成：新增 {added} 个，当前视奸数量: {len(current_ids)}"
         if failed:
             msg += f"；无法解析 {len(failed)} 个：" + ", ".join(f[:40] for f in failed[:5])
+        event.stop_event()
         yield event.plain_result(msg)
 
     @filter.command("sfm_del")
     async def del_group_id(self, event: AstrMessageEvent, steam_id64: str):
         """为当前群删除一个视奸 ID"""
         if not self._is_authorized(event):
+            event.stop_event()
             yield event.plain_result("无权限执行该命令")
             return
         
         raw = (steam_id64 or "").strip()
         if not raw:
+            event.stop_event()
             yield event.plain_result("请提供 SteamID64、好友码或个人主页链接")
             return
 
         resolved, error = await self._resolve_to_steam_id64(raw)
         if not resolved:
+            event.stop_event()
             yield event.plain_result(f"无法解析输入: {error}")
             return
         
@@ -3543,10 +3582,12 @@ class SteamFriendMonitor(Star):
         if ids and resolved in ids:
             ids.remove(resolved)
             await self._update_group_steam_ids_atomic(group_id, ids)
+            event.stop_event()
             yield event.plain_result(
                 f"已从本群移除 {resolved}，当前视奸数量: {len(ids)}"
             )
         else:
+            event.stop_event()
             yield event.plain_result(
                 "该 SteamID 不在本群视奸列表中"
             )
@@ -3555,10 +3596,12 @@ class SteamFriendMonitor(Star):
     async def clear_group_ids(self, event: AstrMessageEvent):
         """清除当前群配置（视奸对象 + 启用状态）"""
         if not self._is_authorized(event):
+            event.stop_event()
             yield event.plain_result("无权限")
             return
         
         group_id = event.unified_msg_origin
         await self._clear_group_config(group_id)
 
+        event.stop_event()
         yield event.plain_result("本群配置已清除")
