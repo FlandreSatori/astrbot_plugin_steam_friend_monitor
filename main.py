@@ -3247,7 +3247,17 @@ class SteamFriendMonitor(Star):
             image_path = await self._render_status_image(
                 ordered_players, event.unified_msg_origin
             )
-            await self._push_image(event.unified_msg_origin, "", image_path)
+            try:
+                await self._push_image(event.unified_msg_origin, "", image_path)
+            except Exception as e:
+                # 发送阶段失败（如 NapCat 发送超时）不代表状态获取失败，避免把原始异常发到群里
+                logger.warning(
+                    f"[steam-monitor] status image push failed target={group_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                event.stop_event()
+                yield event.plain_result("状态图发送超时，若未收到图片请稍后重试")
+                return
             event.stop_event()
         except RuntimeError as e:
             logger.error(f"[steam-monitor] status failed: {e}")
@@ -3268,7 +3278,7 @@ class SteamFriendMonitor(Star):
         except Exception as e:
             logger.error(f"[steam-monitor] status failed: {e}", exc_info=True)
             event.stop_event()
-            yield event.plain_result(f"获取状态失败: {e}")
+            yield event.plain_result(f"获取状态失败（{type(e).__name__}），请稍后重试")
         finally:
             if image_path:
                 self._schedule_delayed_unlink(image_path, 30)
@@ -3315,7 +3325,16 @@ class SteamFriendMonitor(Star):
                     ordered_players, group_id
                 )
                 image_path = await self._render_status_image(ordered_players, group_id)
-                await self._push_image(group_id, "", image_path)
+                try:
+                    await self._push_image(group_id, "", image_path)
+                except Exception as e:
+                    logger.warning(
+                        f"[steam-monitor] sfm_test image push failed target={group_id}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    event.stop_event()
+                    yield event.plain_result("状态图发送超时，若未收到图片请稍后重试")
+                    return
                 event.stop_event()
             except RuntimeError as e:
                 logger.error(f"[steam-monitor] sfm_test force refresh failed: {e}")
@@ -3336,7 +3355,7 @@ class SteamFriendMonitor(Star):
             except Exception as e:
                 logger.error(f"[steam-monitor] sfm_test force refresh failed: {e}", exc_info=True)
                 event.stop_event()
-                yield event.plain_result(f"强制拉取状态失败: {e}")
+                yield event.plain_result(f"强制拉取状态失败（{type(e).__name__}），请稍后重试")
             finally:
                 if image_path:
                     self._schedule_delayed_unlink(image_path, 30)
